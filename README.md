@@ -11,7 +11,7 @@ Tang Nano 20K FPGA draws them with its own 3D core and outputs HDMI. Game data (
 | Папка | Что | Лицензия |
 |---|---|---|
 | `port/` | исходники Quake II (id Software), изменённые под ESP32-S3 | GPL v2 (`port/COPYING`) |
-| `esp/` | модуль Q2.ELF для прошивки ESP VDAC4 (ESP-IDF): LINK, видео, ввод, файлы | GPL v2 (`esp/COPYING`) |
+| `esp/` | Q2.ELF — исполняемый файл FreeRTOS для ESP32-S3: игра, связь с ПЛИС, картинка, клавиатура, файлы | GPL v2 (`esp/COPYING`) |
 | `gpu/front/` | связка рендера Quake II с ядром ПЛИС | GPL v2 (`gpu/front/COPYING`) |
 | `measure/` | сборка Quake II на ПК для замеров памяти и времени, заплатки рендера | GPL v2 (`measure/COPYING`) |
 | `dist/Q2/` | готовый пакет: Q2.SPG (запускатель), Q2.ELF, Q2.BIN | GPL v2 (`dist/COPYING`) |
@@ -20,7 +20,7 @@ Tang Nano 20K FPGA draws them with its own 3D core and outputs HDMI. Game data (
 | `tools/` | сборка пакета, разбор трасс и замеров | MIT |
 | `GPU.md`, `PLAN.md`, `REPORT.md`, `PROGRESS.md` | устройство, план, отчёт, журнал работы | MIT |
 
-Q2.ELF собирается из кода `port/` и потому распространяется под GPL v2, как и пакет `dist/Q2`.
+Q2.ELF собирается из `port/` и `esp/`, поэтому он и пакет `dist/Q2` распространяются под GPL v2.
 Оригинальные исходники: [id-Software/Quake-2](https://github.com/id-Software/Quake-2).
 
 ## Что нужно для игры
