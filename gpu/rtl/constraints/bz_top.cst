@@ -1,0 +1,82 @@
+// =====================================================================================================
+// bz_top.cst — физические ограничения ядра «бомж-3D» (Quake 2): какой порт bz_top на какой ножке ПЛИС.
+// =====================================================================================================
+// Плата: Tang Nano 20K (GW2AR-LV18QN88C8/I7) на плате-носителе VDAC4 (carrier A3.1).
+// Номера выводов — те же, что у FT-ядра VDAC4 (fpga/vdac2/constraints/ts_fb_hdmi_top.cst): ядро стоит
+// на той же плате, только использует меньше выводов (видео Evo, кнопки, flash и microSD не нужны).
+//
+// Как читать строки:
+//   IO_LOC  "порт" N;        — порт верхнего модуля сидит на выводе N корпуса;
+//   IO_PORT "порт" ...;      — электрические свойства: IO_TYPE (стандарт, здесь 3,3 В LVCMOS),
+//                              PULL_MODE (подтяжка внутри ПЛИС: UP — к 1, DOWN — к 0, NONE — нет),
+//                              DRIVE (сила выхода в мА).
+
+// Кварц 27 МГц
+IO_LOC  "clk27" 4;
+IO_PORT "clk27" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// M_SEL от Evo: 1 — монитор у ядра Tang (плагин Quake 2 держит 1 всё время игры)
+IO_LOC  "m_sel" 73;
+IO_PORT "m_sel" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+
+// SPI Z-контроллера Evo (адрес FT812) — второй вход ядра. SCK — не глобальный клоковый вывод:
+// приёмник ft_spi тактируется им через обычную трассировку (так же в FT-ядре)
+IO_LOC  "ft_sck" 20;
+IO_PORT "ft_sck" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+IO_LOC  "ft_cs_n" 17;
+IO_PORT "ft_cs_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+IO_LOC  "ft_mosi" 19;
+IO_PORT "ft_mosi" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "ft_miso" 79;
+IO_PORT "ft_miso" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=NONE;
+IO_LOC  "ft_int_n" 74;
+IO_PORT "ft_int_n" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=NONE;
+
+// SPI BL616 (BL616 — ведущий): снимок состояния, просьба о перезагрузке
+IO_LOC  "cp_sck" 13;
+IO_PORT "cp_sck" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+IO_LOC  "cp_cs_n" 86;
+IO_PORT "cp_cs_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+IO_LOC  "cp_mosi" 76;
+IO_PORT "cp_mosi" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "cp_miso" 75;
+IO_PORT "cp_miso" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=NONE;
+IO_LOC  "cp_irq_n" 69;
+IO_PORT "cp_irq_n" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=NONE;
+
+// LINK к ESP32-S3: QSPI, ESP — ведущий. LINK_SCK — глобальный клоковый вывод GCLKT_1
+IO_LOC  "link_irq_n" 85;
+IO_PORT "link_irq_n" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=NONE;
+IO_LOC  "link_sck" 77;
+IO_PORT "link_sck" IO_TYPE=LVCMOS33 PULL_MODE=DOWN;
+IO_LOC  "link_cs_n" 18;
+IO_PORT "link_cs_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "link_io[0]" 71;
+IO_PORT "link_io[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
+IO_LOC  "link_io[1]" 72;
+IO_PORT "link_io[1]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
+IO_LOC  "link_io[2]" 55;
+IO_PORT "link_io[2]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
+IO_LOC  "link_io[3]" 31;
+IO_PORT "link_io[3]" IO_TYPE=LVCMOS33 PULL_MODE=UP DRIVE=8;
+
+// RECONFIG_N (на плате — только контрольная точка TP1): к 0 — «перезагрузи ПЛИС»; в покое Z и подтяжка
+IO_LOC  "reconfig_n" 9;
+IO_PORT "reconfig_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// Усилитель звука модуля — выключен (вывод 51; на плате-носителе его не занимать)
+IO_LOC  "pa_en" 51;
+IO_PORT "pa_en" IO_TYPE=LVCMOS33 DRIVE=8 PULL_MODE=DOWN;
+
+// HDMI: дифференциальные пары TMDS (эмулированный LVDS: ELVDS_OBUF + LVCMOS33D).
+// DRIVE=4, а не 8: с 8 экран у пользователя терял сигнал (31.10.2026); с 4 работают все ядра VDAC4.
+IO_LOC  "tmds_clk_p" 33,34;
+IO_PORT "tmds_clk_p" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=4;
+IO_LOC  "tmds_data_p[0]" 35,36;
+IO_PORT "tmds_data_p[0]" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=4;
+IO_LOC  "tmds_data_p[1]" 37,38;
+IO_PORT "tmds_data_p[1]" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=4;
+IO_LOC  "tmds_data_p[2]" 39,40;
+IO_PORT "tmds_data_p[2]" IO_TYPE=LVCMOS33D PULL_MODE=NONE DRIVE=4;
+
+// Встроенная SDRAM (O_sdram_*, IO_sdram_dq) выводов не требует: Gowin соединяет её сам по именам портов.

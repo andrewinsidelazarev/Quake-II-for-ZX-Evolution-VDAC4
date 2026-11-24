@@ -1,0 +1,19 @@
+# Данные игры id Software (pak) — не распространяем
+data/
+data-demo/
+dist/Q2-card/
+*.pak
+*.PAK
+
+# Оригинальные исходники id Software — клон github.com/id-Software/Quake-2
+id-source/
+
+# Сборки, трассы, журналы прогонов (сотни МБ, трассы больше предела GitHub)
+build/
+results/
+*.exp
+*.lib
+__pycache__/
+
+# Рабочие правила сессий Claude
+START_BRIEF.md

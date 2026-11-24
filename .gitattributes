@@ -1,0 +1,7 @@
+# битстримы и бинарники — байт в байт (SHA в README выпусков)
+*.fs  binary
+*.BIN binary
+*.bin binary
+*.SPG binary
+*.ELF binary
+*.tr  -text
