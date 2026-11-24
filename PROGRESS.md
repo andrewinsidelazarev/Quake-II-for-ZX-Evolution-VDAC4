@@ -737,3 +737,16 @@
 - 25.11: на плате ESP 0.1.170 (прошита сессией прошивки по слову пользователя). Пакет на карте тот же
   (Q2.SPG 9643adcb…, ядро 0.03); загрузка снова пойдёт путём «новое ядро». Прошивка просит после запуска:
   дошёл ли core_load, нет ли zifi-crash, строку «core Q2 … to the BL616 cache».
+
+## 25.11.2026 — GitHub («сделай пуш на Гитхаб»)
+
+- E:\zx\Quake2 — теперь репозиторий git, origin = github.com/andrewinsidelazarev/Quake-II-for-ZX-Evolution-VDAC4
+  (открытый). Коммит c5b4143 поверх «Initial commit» (LICENSE MIT): 359 файлов.
+- Лицензии по папкам (выбор пользователя «MIT + GPL по папкам»): GPL v2 (COPYING = id-source/gnu.txt) — port,
+  esp, gpu/front, measure, dist; MIT — gpu/rtl, gpu/model, SPEC, tools, документы. README.md — состав и лицензии.
+- Не входят (.gitignore): data, data-demo, dist/Q2-card, *.pak (данные id), id-source (клон id-Software/Quake-2),
+  build, results, *.exp/*.lib, __pycache__, START_BRIEF.md. .gitattributes: .fs/.BIN/.SPG/.ELF — binary, .tr —
+  без перевода строк; SHA файлов в коммите сверены с README выпусков.
+- README пакета (tools/package.py → dist/Q2/README.txt): прошивка 0.1.170+ (на 0.1.164–0.1.169 новое ядро роняет
+  ESP), pak — только с карты Evo (флешка для pak не используется, журнал board_log6: «USB drive not used»).
+  Пересборка пакета меняет в Q2.SPG только 4 байта даты в заголовке — в dist оставлен Q2.SPG 9643adcb… (он на карте).
