@@ -757,7 +757,9 @@ void CrossProduct (vec3_t v1, vec3_t v2, vec3_t cross)
 	cross[2] = v1[0]*v2[1] - v1[1]*v2[0];
 }
 
+#ifndef Q2_ESP_TARGET	// порт VDAC4: на ESP sqrt — макрос sqrtf (compat.h, 26.11.2026)
 double sqrt(double x);
+#endif
 
 vec_t VectorLength(vec3_t v)
 {
@@ -1160,10 +1162,17 @@ int	paged_total;
 
 void Com_PageInMemory (byte *buffer, int size)
 {
+#ifdef Q2_ESP_TARGET
+	// порт VDAC4 (25.11.2026): на ESP подкачки нет — функция только читала память. И читала за краем: модель
+	// в hunk ESP бывает несколькими несмежными кусками (sys_esp.c), а extradatasize — их сумма; Unreal NG
+	// упал «memory fault» за концом PSRAM (Com_PageInMemory из R_EndRegistration). На плате — мусор молча.
+	(void)buffer; (void)size;
+#else
 	int		i;
 
 	for (i=size-1 ; i>0 ; i-=4096)
 		paged_total += buffer[i];
+#endif
 }
 
 

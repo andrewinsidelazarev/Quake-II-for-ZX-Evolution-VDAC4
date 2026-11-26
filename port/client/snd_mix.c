@@ -22,6 +22,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "client.h"
 #include "snd_loc.h"
 
+// порт VDAC4: с хранилищем было 512 (4 КБ PSRAM вместо 16); 26.11.2026 — снова 2048: смешивание идёт реже и
+// крупнее (S_PAINT_BATCH, snd_dma.c), и на каждый канал за кусок — одно чтение SDRAM ядра, а не четыре
 #define	PAINTBUFFER_SIZE	2048
 // порт VDAC4: из зоны, когда звук запустился (S_InitScaletable) — см. known_sfx в snd_dma.c
 portable_samplepair_t *paintbuffer;		// PAINTBUFFER_SIZE пар
@@ -222,6 +224,28 @@ CHANNEL MIXING
 void S_PaintChannelFrom8 (channel_t *ch, sfxcache_t *sc, int endtime, int offset);
 void S_PaintChannelFrom16 (channel_t *ch, sfxcache_t *sc, int endtime, int offset);
 
+#ifdef Q2_SND_STORE
+/*
+порт VDAC4 (25.11.2026): отсчёты count звука sc с позиции pos. Звук в хранилище SDRAM ядра (snd_mem.c,
+S_StoreSfx) — кусок читается по LINK во временный буфер (адрес чтения кратен 4: берём с выравниванием и
+отдаём со сдвигом). count не больше PAINTBUFFER_SIZE: S_PaintChannels рисует не дальше буфера.
+*/
+static int	snd_fetch[(PAINTBUFFER_SIZE * 2 + 8) / sizeof(int)];
+
+static const byte *S_SfxData (sfxcache_t *sc, int pos, int count)
+{
+	uint32_t	addr, skip, n;
+
+	if (!sc->store)
+		return sc->data + pos * sc->width;
+	addr = sc->store + (uint32_t)(pos * sc->width);
+	skip = addr & 3u;
+	n = (skip + (uint32_t)(count * sc->width) + 3u) & ~3u;
+	BZ_StoreRead (addr - skip, snd_fetch, n);
+	return (const byte *)snd_fetch + skip;
+}
+#endif
+
 void S_PaintChannels(int endtime)
 {
 	int 	i;
@@ -353,12 +377,14 @@ void S_InitScaletable (void)
 	int		i, j;
 	int		scale;
 
-	if (!snd_scaletable)	// порт VDAC4: первый вызов — из S_Init, когда звук запустился
-	{
-		snd_scaletable = Z_Malloc (32 * sizeof(*snd_scaletable));
+	if (!paintbuffer)	// порт VDAC4: первый вызов — из S_Init, когда звук запустился
 		paintbuffer = Z_Malloc (PAINTBUFFER_SIZE * sizeof(portable_samplepair_t));
-	}
 	s_volume->modified = false;
+#ifdef Q2_SND_STORE
+	return;		// порт VDAC4: таблицы нет — S_PaintChannelFrom8 умножает (те же числа, 32 КБ PSRAM)
+#endif
+	if (!snd_scaletable)
+		snd_scaletable = Z_Malloc (32 * sizeof(*snd_scaletable));
 	for (i=0 ; i<32 ; i++)
 	{
 		scale = i * 8 * 256 * s_volume->value;
@@ -369,7 +395,7 @@ void S_InitScaletable (void)
 
 
 #if !(defined __linux__ && defined __i386__)
-#if	!id386
+#if	!id386 || defined Q2_SND_STORE	// порт VDAC4: с хранилищем — только C (у asm свой адрес data)
 
 void S_PaintChannelFrom8 (channel_t *ch, sfxcache_t *sc, int count, int offset)
 {
@@ -384,8 +410,28 @@ void S_PaintChannelFrom8 (channel_t *ch, sfxcache_t *sc, int count, int offset)
 	if (ch->rightvol > 255)
 		ch->rightvol = 255;
 		
-	lscale = snd_scaletable[ ch->leftvol >> 11];
-	rscale = snd_scaletable[ ch->rightvol >> 11];
+	// порт VDAC4 (25.11.2026): у id в C-версии «>> 11» — громкость 0…255 всегда давала строку 0, то есть
+	// тишину (на Windows id звучал ассемблер: and eax,0F8h; shl eax,7 — это строка vol >> 3). На ESP есть
+	// только C — строка, как у ассемблера.
+#ifdef Q2_SND_STORE
+	{
+		// строка таблицы id: (signed char)j * scale, scale — как в S_InitScaletable (i * 8 * 256 * s_volume)
+		int		lsc = (ch->leftvol >> 3) * 8 * 256 * s_volume->value;
+		int		rsc = (ch->rightvol >> 3) * 8 * 256 * s_volume->value;
+		signed char	*ssfx = (signed char *)S_SfxData (sc, ch->pos, count);
+
+		samp = &paintbuffer[offset];
+		for (i=0 ; i<count ; i++, samp++)
+		{
+			data = ssfx[i];
+			samp->left += data * lsc;
+			samp->right += data * rsc;
+		}
+		(void)lscale; (void)rscale; (void)sfx;
+	}
+#else
+	lscale = snd_scaletable[ ch->leftvol >> 3];
+	rscale = snd_scaletable[ ch->rightvol >> 3];
 	sfx = (signed char *)sc->data + ch->pos;
 
 	samp = &paintbuffer[offset];
@@ -396,6 +442,7 @@ void S_PaintChannelFrom8 (channel_t *ch, sfxcache_t *sc, int count, int offset)
 		samp->left += lscale[data];
 		samp->right += rscale[data];
 	}
+#endif
 	
 	ch->pos += count;
 }
@@ -486,7 +533,11 @@ void S_PaintChannelFrom16 (channel_t *ch, sfxcache_t *sc, int count, int offset)
 
 	leftvol = ch->leftvol*snd_vol;
 	rightvol = ch->rightvol*snd_vol;
+#ifdef Q2_SND_STORE
+	sfx = (signed short *)S_SfxData (sc, ch->pos, count);
+#else
 	sfx = (signed short *)sc->data + ch->pos;
+#endif
 
 	samp = &paintbuffer[offset];
 	for (i=0 ; i<count ; i++, samp++)

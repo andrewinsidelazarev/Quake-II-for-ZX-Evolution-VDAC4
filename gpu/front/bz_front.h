@@ -48,6 +48,8 @@ uint32_t    BZ_StoreAlloc (uint32_t bytes);                     /* адрес (�
 void        BZ_StoreFree (uint32_t addr, uint32_t bytes);
 void        BZ_StoreWrite (uint32_t addr, const void *data, uint32_t bytes);
 void        BZ_StoreMark (void);                                /* после загрузки модели */
+void        BZ_StoreRead (uint32_t addr, void *dst, uint32_t bytes);   /* звук: адрес кратен 4 */
+uint32_t    BZ_StoreGeneration (void);                          /* раскладка SDRAM (звук — перечитать) */
 uint32_t    BZ_StoreBytes (void);
 uint32_t    BZ_CmdBufBytes (void);                              /* байт в буферах команд кадра и неба */
 const void *BZ_Md2Frame (uint32_t id, int frame, uint32_t addr, int size);
@@ -69,6 +71,12 @@ void BZ_AlphaSurfaces (void);
 void BZ_AliasModelBegin (void *pfinalverts, int num);   /* модель: вершины уже в экране */
 void BZ_AliasModelEnd (void);                           /* модель кончилась: отправить пачку */
 void BZ_AliasTriangle (int kind);   /* 0 — непрозрачно, 1/2 — 33/66 %, 3/4 — оболочка 33/66 % */
+int  BZ_AliasKind (void);           /* r_polyse.c: вид закраски по функции отрезков id (как у BZ_AliasTriangle) */
+/* Все треугольники модели разом, по номерам md2 (26.11.2026): 1 — сделано, 0 — пусть их ведёт цикл id */
+int  BZ_AliasModelTris (void *pmdl, void *pfinalverts, int reverse, int kind);
+/* Горячий модуль Q2HOT.ELF (26.11.2026, bz_int.h): таблицы для его точки входа и переход на его функции */
+void BZ_HotTables (void **imp, void **exp);
+int  BZ_HotUse (int on);
 void BZ_Particle (int u, int v, float zi, int pix, int color, int level);
 void BZ_DrawPoly (int iswater, int blendcolor);
 void BZ_CalcGradients (struct msurface_s *pface, int mip);   /* в r_edge.c: miplevel там static */

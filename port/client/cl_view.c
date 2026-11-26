@@ -248,7 +248,7 @@ Call before entering a new level, or after changing dlls
 void CL_PrepRefresh (void)
 {
 	char		mapname[32];
-	int			i;
+	int			i, nmodels;
 	char		name[MAX_QPATH];
 	float		rotate;
 	vec3_t		axis;
@@ -264,8 +264,9 @@ void CL_PrepRefresh (void)
 	mapname[strlen(mapname)-4] = 0;		// cut off ".bsp"
 
 	// register models, pics, and skins
-	Com_Printf ("Map: %s\r", mapname); 
+	Com_Printf ("Map: %s\r", mapname);
 	SCR_UpdateScreen ();
+	SCR_LoadingProgress (LS_WORLD, 0, 1);	// порт VDAC4: полоса загрузки (файл карты — ri.LoadingProgress)
 	re.BeginRegistration (mapname);
 	Com_Printf ("                                     \r");
 
@@ -280,8 +281,11 @@ void CL_PrepRefresh (void)
 	num_cl_weaponmodels = 1;
 	strcpy(cl_weaponmodels[0], "weapon.md2");
 
+	for (nmodels=1 ; nmodels<MAX_MODELS && cl.configstrings[CS_MODELS+nmodels][0] ; nmodels++)
+		;	// порт VDAC4: сколько моделей — для полосы загрузки
 	for (i=1 ; i<MAX_MODELS && cl.configstrings[CS_MODELS+i][0] ; i++)
 	{
+		SCR_LoadingProgress (LS_MODELS, i - 1, nmodels - 1);
 		strcpy (name, cl.configstrings[CS_MODELS+i]);
 		name[37] = 0;	// never go beyond one line
 		if (name[0] != '*')
@@ -311,8 +315,9 @@ void CL_PrepRefresh (void)
 	}
 	cl.clip_generation = CM_Generation ();	// порт VDAC4: model_clip — этой карты
 
-	Com_Printf ("images\r", i); 
+	Com_Printf ("images\r", i);
 	SCR_UpdateScreen ();
+	SCR_LoadingProgress (LS_REST, 0, 4);
 	for (i=1 ; i<MAX_IMAGES && cl.configstrings[CS_IMAGES+i][0] ; i++)
 	{
 		cl.image_precache[i] = re.RegisterPic (cl.configstrings[CS_IMAGES+i]);
@@ -320,6 +325,7 @@ void CL_PrepRefresh (void)
 	}
 	
 	Com_Printf ("                                     \r");
+	SCR_LoadingProgress (LS_REST, 1, 4);
 	for (i=0 ; i<MAX_CLIENTS ; i++)
 	{
 		if (!cl.configstrings[CS_PLAYERSKINS+i][0])
@@ -334,8 +340,9 @@ void CL_PrepRefresh (void)
 	CL_LoadClientinfo (&cl.baseclientinfo, "unnamed\\male/grunt");
 
 	// set sky textures and speed
-	Com_Printf ("sky\r", i); 
+	Com_Printf ("sky\r", i);
 	SCR_UpdateScreen ();
+	SCR_LoadingProgress (LS_REST, 2, 4);
 	rotate = atof (cl.configstrings[CS_SKYROTATE]);
 	sscanf (cl.configstrings[CS_SKYAXIS], "%f %f %f", 
 		&axis[0], &axis[1], &axis[2]);
@@ -343,7 +350,9 @@ void CL_PrepRefresh (void)
 	Com_Printf ("                                     \r");
 
 	// the renderer can now free unneeded stuff
+	SCR_LoadingProgress (LS_REST, 3, 4);
 	re.EndRegistration ();
+	SCR_LoadingProgress (LS_REST, 4, 4);
 
 	// clear any lines of console text
 	Con_ClearNotify ();
@@ -468,7 +477,7 @@ void V_RenderView( float stereo_separation )
 		// build a refresh entity list and calc cl.sim*
 		// this also calls CL_CalcViewValues which loads
 		// v_forward, etc.
-		CL_AddEntities ();
+		Q2M_BEGIN(Q2M_C_ENTS); CL_AddEntities (); Q2M_END(Q2M_C_ENTS);	// порт VDAC4: замер (q2m.h)
 
 		if (cl_testparticles->value)
 			V_TestParticles ();

@@ -220,6 +220,9 @@ typedef struct
 	qboolean	(*Vid_GetModeInfo)( int *width, int *height, int mode );
 	void		(*Vid_MenuInit)( void );
 	void		(*Vid_NewWindow)( int width, int height );
+
+	// порт VDAC4 (26.11.2026): ход загрузки мира (байты файла карты) — полоса под LOADING; может быть NULL
+	void		(*LoadingProgress)( int done, int total );
 } refimport_t;
 
 

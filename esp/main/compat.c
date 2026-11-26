@@ -37,13 +37,19 @@ static void out_of_memory (const char *what, size_t n)
 	Sys_Error ("%s: no memory for %u bytes", what, (unsigned)n);
 }
 
+/* 26.11.2026 (плата board_log22): после моделей прошлой карты — запасные буферы кадра (bz_front.c), по одному. */
+int q2_mem_reclaim (void)
+{
+	return R_EspPurgeStale () || BZ_ReleaseSpare ();
+}
+
 void *q2_malloc (size_t n)
 {
 	void *p = q2_core->alloc (n ? n : 1, ZM_MEM_PSRAM);
 
 	/* Не хватило: пока идёт загрузка карты, рендер может отдать модель прошлой карты
 	 * (R_EspPurgeStale, p06) — по одной, самую большую, и снова попробовать. */
-	while (!p && R_EspPurgeStale ())
+	while (!p && q2_mem_reclaim ())
 		p = q2_core->alloc (n ? n : 1, ZM_MEM_PSRAM);
 	if (!p)
 		out_of_memory ("malloc", n);
@@ -67,7 +73,7 @@ void *q2_realloc (void *p, size_t n)
 	if (!p)
 		return q2_malloc (n);
 	q = q2_core->realloc (p, n ? n : 1);
-	while (!q && R_EspPurgeStale ())	/* как в q2_malloc: модели прошлой карты — прочь */
+	while (!q && q2_mem_reclaim ())	/* как в q2_malloc: модели прошлой карты — прочь */
 		q = q2_core->realloc (p, n ? n : 1);
 	if (!q)
 		out_of_memory ("realloc", n);
@@ -112,6 +118,15 @@ typedef struct
 
 static memfile_t mem_files[MEM_FILES];
 static q2file_t  open_files[16];
+
+/* Кусок упреждающего чтения файла хранилища (q2_fread, store_read_ra) */
+#define RA_SIZE 8192u
+static struct
+{
+	q2file_t *file;             /* чей кусок (NULL — нет)        */
+	uint32_t  off, len;         /* с какого места файла и сколько */
+	uint8_t  *buf;
+} ra;
 
 /* Сколько PSRAM держат файлы в памяти (то, что Quake 2 записал: сохранения уровня и т. п.) и сколько их —
  * для отчёта о памяти (sys_esp.c q2_mem_report). */
@@ -211,6 +226,8 @@ int q2_fclose (FILE *stream)
 		return EOF;
 	if (f->store)
 		q2_store_close (f->store);
+	if (ra.file == f)
+		ra.file = NULL;             /* кусок упреждающего чтения — этого файла */
 	memset (f, 0, sizeof(*f));
 	return 0;
 }
@@ -218,6 +235,37 @@ int q2_fclose (FILE *stream)
 static uint32_t file_size (q2file_t *f)
 {
 	return f->mem ? f->mem->size : f->size;
+}
+
+/*
+ * Упреждающее чтение файлов хранилища (26.11.2026). Каждый data_read — запрос к прошивке, а без флешки —
+ * обмен с программой Z80 на Evo. Мелкие чтения подряд (демо: длина сообщения и само сообщение — два чтения
+ * за кадр; плата board_log13: sv ~7 мс за кадр) берутся из одного куска RA_SIZE, прочитанного за раз. Чтения
+ * больше половины куска (загрузка уровня, картинки) идут прямо. Кусок — одного открытого файла; при его
+ * закрытии забывается (тот же дескриптор прошивки может достаться другому файлу).
+ */
+static uint32_t store_read_ra (q2file_t *f, void *data, uint32_t bytes)
+{
+	uint32_t want;
+
+	if (bytes > RA_SIZE / 2)
+		return q2_store_read (f->store, f->pos, data, bytes);
+	if (ra.file != f || f->pos < ra.off || f->pos + bytes > ra.off + ra.len)
+	{
+		if (!ra.buf)
+			ra.buf = q2_malloc (RA_SIZE);
+		if (!ra.buf)
+			return q2_store_read (f->store, f->pos, data, bytes);
+		want = f->size - f->pos < RA_SIZE ? f->size - f->pos : RA_SIZE;
+		ra.file = NULL;
+		ra.len = q2_store_read (f->store, f->pos, ra.buf, want);
+		ra.off = f->pos;
+		ra.file = f;
+		if (bytes > ra.len)
+			bytes = ra.len;         /* короткое чтение — как у прямого */
+	}
+	memcpy (data, ra.buf + (f->pos - ra.off), bytes);
+	return bytes;
 }
 
 size_t q2_fread (void *data, size_t size, size_t count, FILE *stream)
@@ -237,7 +285,7 @@ size_t q2_fread (void *data, size_t size, size_t count, FILE *stream)
 	if (f->mem)
 		memcpy (data, f->mem->data + f->pos, bytes);
 	else
-		bytes = q2_store_read (f->store, f->pos, data, bytes);
+		bytes = store_read_ra (f, data, bytes);
 	f->pos += bytes;
 	return bytes / size;
 }

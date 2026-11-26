@@ -201,6 +201,8 @@ def build():
     defs = ('/DC_ONLY /DWIN32 /D_WINDOWS /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /D_CRT_NONSTDC_NO_DEPRECATE '
             '/D_WINSOCK_DEPRECATED_NO_WARNINGS')
     cflags = f'/nologo /O2 /MD /W1 /MP /GS- /utf-8 /wd4828 {defs}'
+    if os.environ.get('Q2M_ASAN'):
+        cflags += ' /fsanitize=address /Zi'
 
     game = sorted(str(p) for p in (SRC / 'game').glob('*.c'))
     ref_gl = files('ref_gl', 'gl_draw.c gl_image.c gl_light.c gl_mesh.c gl_model.c gl_rmain.c '
@@ -268,15 +270,18 @@ def build():
         game_ren = '/Ddedicated=game_dedicated /Dmaxclients=game_maxclients'
         ref_ren = '/Dvid_fullscreen=r_vid_fullscreen /Dvid_gamma=r_vid_gamma'
         groups = [
-            ('q2esp_eng', exe, f'{hard} /Zi /Fd"{OBJ / "q2esp_eng"}\\\\" /FI"{MEASURE / "q2m.h"}" '
+            # Q2_SND_STORE (25.11.2026): отсчёты звуков — в хранилище SDRAM ядра, как на ESP (snd_mem.c)
+            ('q2esp_eng', exe, f'{hard} /DQ2_SND_STORE /Zi /Fd"{OBJ / "q2esp_eng"}\\\\" /FI"{MEASURE / "q2m.h"}" '
                                f'/I"{MEASURE}" /I"{SRC / "qcommon"}"'),
             ('q2esp_game', [g for g in game if pathlib.Path(g).name not in ('q_shared.c', 'm_flash.c')],
              f'{hard} {game_ren} /Zi /Fd"{OBJ / "q2esp_game"}\\\\"'),
+            # esp/hot/q2hot.c (26.11.2026) — горячий модуль ESP: здесь тот же исходник через таблицы, q2esp с
+            # Q2M_HOT=1 зовёт его вместо своих копий — кадры сверяются с обычной сборкой
             ('q2esp_ref', sorted(str(p) for p in espdir.glob('*.c')) +
              [str(GPU / 'front/bz_front.c'), str(GPU / 'front/swimp_bz.c'), str(GPU / 'front/bz_crash.c'),
-              str(GPU / 'model/bomzh.c')],
-             f'{hard} {ref_ren} /DBZ_ONLY /DBZ_TEX_RESIDENT /Zi /Fd"{OBJ / "q2esp_ref"}\\\\" /I"{espdir}" /I"{SRC / "ref_soft"}" '
-             f'/I"{GPU / "front"}" /I"{GPU / "model"}"'),
+              str(GPU / 'model/bomzh.c'), str(ROOT / 'esp/hot/q2hot.c')],
+             f'{hard} {ref_ren} /DBZ_ONLY /DBZ_TEX_RESIDENT /FI"{MEASURE / "q2m.h"}" /Zi /Fd"{OBJ / "q2esp_ref"}\\\\" /I"{espdir}" /I"{SRC / "ref_soft"}" '
+             f'/I"{GPU / "front"}" /I"{GPU / "model"}" /I"{ROOT / "esp/hot"}"'),
         ]
         esp_steps = [compile_only(n, s, e) for n, s, e in groups] + [
             f'link /NOLOGO /DEBUG /MAP:"{OBJ / "q2esp.map"}" /OUT:"{BIN / "q2esp.exe"}" ' +
@@ -317,6 +322,16 @@ if __name__ == '__main__':
         GEN = BUILD / 'port/gen'
         BIN = BUILD / 'port/bin'
         OBJ = BUILD / 'port/obj'
+        if os.environ.get('Q2M_ASAN'):
+            # AddressSanitizer (25.11.2026): чтение/запись за краем буфера ловится с местом и стеком —
+            # на ESP такое молча читает мусор, а Unreal NG падает «memory fault» без имени функции
+            BIN = BUILD / 'port_asan/bin'
+            OBJ = BUILD / 'port_asan/obj'
+        if os.environ.get('Q2M_OUT'):
+            # своя папка вывода (26.11.2026): две сессии собирают разом и не мешают друг другу
+            GEN = BUILD / os.environ['Q2M_OUT'] / 'gen'
+            BIN = BUILD / os.environ['Q2M_OUT'] / 'bin'
+            OBJ = BUILD / os.environ['Q2M_OUT'] / 'obj'
         GEN.mkdir(parents=True, exist_ok=True)
         gen_qgl()
     else:

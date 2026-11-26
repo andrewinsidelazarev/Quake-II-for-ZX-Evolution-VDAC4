@@ -106,6 +106,7 @@ void	VID_Init (void)
     ri.FS_FreeFile = FS_FreeFile;
     ri.FS_Gamedir = FS_Gamedir;
 	ri.Vid_NewWindow = VID_NewWindow;
+	ri.LoadingProgress = NULL;	// порт VDAC4: полосы загрузки нет
     ri.Cvar_Get = Cvar_Get;
     ri.Cvar_Set = Cvar_Set;
     ri.Cvar_SetValue = Cvar_SetValue;

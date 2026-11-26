@@ -33,8 +33,26 @@ typedef struct
 	int 		speed;			// not needed, because converted on load?
 	int 		width;
 	int 		stereo;
+#ifdef Q2_SND_STORE
+	// порт VDAC4 (25.11.2026): отсчёты звука — в хранилище SDRAM ядра «бомж-3D» (в PSRAM ESP звуки уровня,
+	// 1,6–2,5 МБ, не влезают). store — адрес там (0 — отсчёты здесь, в data), store_gen — раскладка SDRAM,
+	// при которой его положили (смена режима экрана стирает хранилище — звук тогда читается заново).
+	unsigned	store;
+	unsigned	store_gen;
+#endif
 	byte		data[1];		// variable sized
 } sfxcache_t;
+
+#ifdef Q2_SND_STORE
+#include <stdint.h>
+// хранилище SDRAM ядра (gpu/front/bz_front.c)
+uint32_t	BZ_StoreAlloc (uint32_t bytes);
+void		BZ_StoreFree (uint32_t addr, uint32_t bytes);
+void		BZ_StoreWrite (uint32_t addr, const void *data, uint32_t bytes);
+void		BZ_StoreMark (void);
+void		BZ_StoreRead (uint32_t addr, void *dst, uint32_t bytes);	// адрес кратен 4
+uint32_t	BZ_StoreGeneration (void);
+#endif
 
 typedef struct sfx_s
 {
@@ -152,6 +170,7 @@ wavinfo_t GetWavinfo (char *name, byte *wav, int wavlength);
 void S_InitScaletable (void);
 
 sfxcache_t *S_LoadSound (sfx_t *s);
+void S_FreeSfxCache (sfx_t *sfx);	// порт VDAC4: Z_Free кэша звука (и его места в SDRAM)
 
 void S_IssuePlaysound (playsound_t *ps);
 

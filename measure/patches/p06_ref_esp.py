@@ -309,13 +309,24 @@ ESP = {
          'static FILE\t*bsp_file;\t// файл карты, пока Mod_LoadBrushModel её разбирает (NULL — не карта)\n'
          'static int\tbsp_base;\t// его место в pak\n'
          'static byte\t*bsp_scratch;\t// буфер lump-ов карты, один на все (Mod_LumpScratch; NULL — нет)\n'
-         'static int\tbsp_scratch_size;\n'),
+         'static int\tbsp_scratch_size;\n'
+         'static int\tbsp_read;\t// сколько байт карты прочитано — для полосы загрузки (ri.LoadingProgress)\n'
+         'static int\tbsp_total;\t// сколько всего прочитают lump-ы рендера (Mod_LumpScratch; 0 — длина файла)\n'
+         '\n'
+         '// ref_esp (26.11.2026): полоса загрузки под LOADING — ход чтения файла карты\n'
+         'static void Mod_BspProgress (int len)\n'
+         '{\n'
+         '\tbsp_read += len;\n'
+         '\tif (ri.LoadingProgress)\n'
+         '\t\tri.LoadingProgress (bsp_read, bsp_total > 0 ? bsp_total : modfilelen);\n'
+         '}\n'),
         ('\tmodfilelen = ri.FS_LoadFile (mod->name, (void **)&buf);\n',
          '\t// ref_esp: у карты (.bsp) — только заголовок; lump-ы читает Mod_Lump по одному\n'
          '\tif (strlen (mod->name) > 4 && !Q_stricmp (mod->name + strlen (mod->name) - 4, ".bsp"))\n'
          '\t{\n'
          '\t\tbuf = NULL;\n'
          '\t\tmodfilelen = FS_FOpenFile (mod->name, &bsp_file);\n'
+         '\t\tbsp_read = bsp_total = 0;\n'
          '\t\tif (bsp_file)\n'
          '\t\t{\n'
          '\t\t\tbsp_base = ftell (bsp_file);\n'
@@ -358,9 +369,13 @@ ESP = {
          '\tbsp_scratch = NULL;\n'
          '\tif (!bsp_file)\n'
          '\t\treturn;\n'
+         '\tbsp_total = header->lumps[LUMP_LIGHTING].filelen;\t// полоса загрузки: свет и lump-ы ниже\n'
          '\tfor (i = 0 ; i < (int)(sizeof(read) / sizeof(read[0])) ; i++)\n'
+         '\t{\n'
+         '\t\tbsp_total += header->lumps[read[i]].filelen;\n'
          '\t\tif (header->lumps[read[i]].filelen > size)\n'
          '\t\t\tsize = header->lumps[read[i]].filelen;\n'
+         '\t}\n'
          '\tbsp_scratch = Mod_TempAlloc (size);\n'
          '\tbsp_scratch_size = size;\n'
          '}\n'
@@ -370,6 +385,7 @@ ESP = {
          '{\n'
          '\tfseek (bsp_file, bsp_base + offset, SEEK_SET);\n'
          '\tFS_Read (bsp_scratch, len, bsp_file);\n'
+         '\tMod_BspProgress (len);\n'
          '}\n'
          '\n'
          '// ref_esp: загрузчик id над одним lump-ом карты (у файла целиком — как у id)\n'
@@ -391,6 +407,7 @@ ESP = {
          '\t\treturn;\n'
          '\t}\n'
          '\tpart = FS_ReadPart (bsp_file, bsp_base, l->fileofs, l->filelen);\n'
+         '\tMod_BspProgress (l->filelen);\n'
          '\tmod_base = part - l->fileofs;\n'
          '\tload (l);\n'
          '\tmod_base = whole;\n'
@@ -723,6 +740,22 @@ ESP = {
          '\tBZ_Md2Access (currentmodel->name, thisframe, pmdl->framesize);\n'
          '\tif (lastframe != thisframe)\n'
          '\t\tBZ_Md2Access (currentmodel->name, lastframe, pmdl->framesize);\n'),
+        # 26.11.2026, горячий модуль Q2HOT.ELF: перевод вершин модели в экран (R_AliasTransformFinalVerts,
+        # R_AliasProjectAndClipTestFinalVert — ~11 % команд кадра) — в gpu/front/bz_hot.c тем же текстом; здесь
+        # их нет, их имена даёт bz_front.c (своя копия или копия модуля во внутреннем ОЗУ). s_ziscale модуль
+        # берёт по адресу — не static.
+        ('static float\ts_ziscale;\n',
+         'float\ts_ziscale;\t\t// ref_esp: адрес берёт горячий модуль (bz_front.c, BZ_HotTables)\n'),
+        ('#else\nvoid R_AliasTransformFinalVerts( int numpoints, finalvert_t *fv, dtrivertx_t *oldv, dtrivertx_t *newv )\n'
+         '{\n\tint i;\n',
+         '#elif 0\t// ref_esp: перенесена в gpu/front/bz_hot.c (горячий модуль)\n'
+         'void R_AliasTransformFinalVerts( int numpoints, finalvert_t *fv, dtrivertx_t *oldv, dtrivertx_t *newv )\n'
+         '{\n\tint i;\n'),
+        ('void R_AliasProjectAndClipTestFinalVert( finalvert_t *fv )\n{\n',
+         '#if 0\t// ref_esp: перенесена в gpu/front/bz_hot.c (горячий модуль)\n'
+         'void R_AliasProjectAndClipTestFinalVert( finalvert_t *fv )\n{\n'),
+        ('\t\tfv->flags |= ALIAS_BOTTOM_CLIP;\t\n}\n',
+         '\t\tfv->flags |= ALIAS_BOTTOM_CLIP;\t\n}\n#endif\n'),
     ],
     'r_model.h': [
         # модель md2: адреса кадров анимации — они лежат группами в разных кусках hunk (md2_load, r_model.c)
@@ -810,6 +843,93 @@ ESP = {
          '\tBZ_FadeScreen ();\t// ref_bz\n\treturn;\t\t\t\t\t\t\t// ref_esp\n'),
     ],
 }
+
+
+# Замер частей рендера (25.11.2026, «оптимизация быстродействия»): метки Q2M_R_* (measure/q2m.h) — время по
+# частям R_RenderFrame на плате (журнал раз в 5 с, esp/main/q2_app.c) и на ПК (q2esp.exe).
+ESP['r_main.c'] += [
+    ('\tR_SetupFrame ();\n',
+     '\tQ2M_BEGIN (Q2M_R_SETUP);\n\tR_SetupFrame ();\n'),
+    ('\tR_PushDlights (r_worldmodel);\n',
+     '\tR_PushDlights (r_worldmodel);\n\tQ2M_END (Q2M_R_SETUP);\n'),
+    ('\tR_RenderWorld ();\n',
+     '\tQ2M_BEGIN (Q2M_R_WORLD);\n\tR_RenderWorld ();\n\tQ2M_END (Q2M_R_WORLD);\n'),
+    ('\tR_DrawBEntitiesOnList ();\n',
+     '\tQ2M_BEGIN (Q2M_R_BMODEL);\n\tR_DrawBEntitiesOnList ();\n\tQ2M_END (Q2M_R_BMODEL);\n'),
+    ('\tR_DrawEntitiesOnList ();\n',
+     '\tQ2M_BEGIN (Q2M_R_ENT);\n\tR_DrawEntitiesOnList ();\n\tQ2M_END (Q2M_R_ENT);\n'),
+    ('\tR_DrawParticles ();\n',
+     '\tQ2M_BEGIN (Q2M_R_PART);\n\tR_DrawParticles ();\n\tQ2M_END (Q2M_R_PART);\n'),
+    ('\tR_DrawAlphaSurfaces();\n',
+     '\tQ2M_BEGIN (Q2M_R_ALPHA);\n\tR_DrawAlphaSurfaces();\n\tQ2M_END (Q2M_R_ALPHA);\n'),
+]
+
+
+# Перечитывание текстуры .wal (25.11.2026): только заголовок (100 байт) и нужный мип-уровень, а не весь файл.
+# На плате файл идёт с карты Evo (~76 КБ/с): стена 256×256 — 87 КБ (все уровни) и столько же PSRAM одним
+# куском посреди игры, а дальнему уровню нужно 1–4 КБ. Движок и рендер — одна программа (REF_HARD_LINKED),
+# поэтому FS_FOpenFile / FS_Read зовутся напрямую.
+# Части моделей (26.11.2026, «нужно хотя бы 30 fps»: на плате ent ~15 мс кадра) — метки на модель, не на
+# треугольник: кадры md2 (с чтением SDRAM ядра), свет (R_LightPoint), перевод вершин в экран, треугольники в
+# пачку; и счёт моделей, вершин, треугольников (Q2M_K_* — числа, а не такты).
+ESP['r_alias.c'] += [
+    ('\tR_AliasSetupFrames( s_pmdl );\n',
+     '\tQ2M_BEGIN (Q2M_A_FRM);\n\tR_AliasSetupFrames( s_pmdl );\n\tQ2M_END (Q2M_A_FRM);\n'),
+    ('\tR_AliasSetupLighting ();\n',
+     '\tQ2M_BEGIN (Q2M_A_LIT);\n\tR_AliasSetupLighting ();\n\tQ2M_END (Q2M_A_LIT);\n'),
+    ('\tR_AliasTransformFinalVerts( aliasbatchedtransformdata.num_points,\n',
+     '\tq2m_acc[Q2M_K_MDL]++;\n'
+     '\tq2m_acc[Q2M_K_VERT] += s_pmdl->num_xyz;\n'
+     '\tq2m_acc[Q2M_K_TRI] += s_pmdl->num_tris;\n'
+     '\tQ2M_BEGIN (Q2M_A_XF);\n'
+     '\tR_AliasTransformFinalVerts( aliasbatchedtransformdata.num_points,\n'),
+    ('\t\tBZ_AliasModelBegin (pfinalverts, s_pmdl->num_xyz);\n',
+     '\t\tQ2M_END (Q2M_A_XF);\n'
+     '\t\tQ2M_BEGIN (Q2M_A_TRS);\n'
+     '\t\tBZ_AliasModelBegin (pfinalverts, s_pmdl->num_xyz);\n'),
+    ('\t\t\tBZ_AliasModelEnd ();\n\t\t\treturn;\n',
+     '\t\t\tBZ_AliasModelEnd ();\n\t\t\tQ2M_END (Q2M_A_TRS);\n\t\t\treturn;\n'),
+]
+
+
+ESP.setdefault('r_image.c', []).append((
+    '\t\tmiptex_t\t*mt;\n'
+    '\t\tint\t\t\tsize = ri.FS_LoadFile (image->name, (void **)&mt);\n'
+    '\n'
+    '\t\tif (!mt)\n'
+    '\t\t\treturn NULL;\n'
+    '\t\tif (mip >= 0 && mip < MIPLEVELS && LittleLong (mt->width) == image->width &&\n'
+    '\t\t    LittleLong (mt->height) == image->height &&\n'
+    '\t\t    LittleLong (mt->offsets[mip]) + w * h <= size)\n'
+    '\t\t{\n'
+    '\t\t\tout = malloc (w * h);\n'
+    '\t\t\tmemcpy (out, (byte *)mt + LittleLong (mt->offsets[mip]), w * h);\n'
+    '\t\t}\n'
+    '\t\tri.FS_FreeFile (mt);\n',
+    '\t\t// ref_esp: только заголовок и нужный мип-уровень — не весь файл (25.11.2026)\n'
+    '\t\tint\t\tFS_FOpenFile (char *filename, FILE **file);\n'
+    '\t\tvoid\tFS_Read (void *buffer, int len, FILE *f);\n'
+    '\t\tvoid\tFS_FCloseFile (FILE *f);\n'
+    '\t\tmiptex_t\tmt;\n'
+    '\t\tFILE\t\t*f;\n'
+    '\t\tint\t\t\tsize = FS_FOpenFile (image->name, &f), base;\n'
+    '\n'
+    '\t\tif (!f)\n'
+    '\t\t\treturn NULL;\n'
+    '\t\tbase = ftell (f);\n'
+    '\t\tif (size >= (int)sizeof(mt))\n'
+    '\t\t{\n'
+    '\t\t\tFS_Read (&mt, sizeof(mt), f);\n'
+    '\t\t\tif (mip >= 0 && mip < MIPLEVELS && LittleLong (mt.width) == image->width &&\n'
+    '\t\t\t    LittleLong (mt.height) == image->height &&\n'
+    '\t\t\t    LittleLong (mt.offsets[mip]) + w * h <= size)\n'
+    '\t\t\t{\n'
+    '\t\t\t\tout = malloc (w * h);\n'
+    '\t\t\t\tfseek (f, base + LittleLong (mt.offsets[mip]), SEEK_SET);\n'
+    '\t\t\t\tFS_Read (out, w * h, f);\n'
+    '\t\t\t}\n'
+    '\t\t}\n'
+    '\t\tFS_FCloseFile (f);\n'))
 
 
 def make(src, out):

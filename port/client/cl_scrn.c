@@ -420,6 +420,7 @@ void SCR_Init (void)
 	scr_graphscale = Cvar_Get ("graphscale", "1", 0);
 	scr_graphshift = Cvar_Get ("graphshift", "0", 0);
 	scr_drawall = Cvar_Get ("scr_drawall", "0", 0);
+	scr_loadbar = Cvar_Get ("scr_loadbar", "1", 0);	// порт VDAC4: полоса загрузки под LOADING
 
 //
 // register our commands
@@ -554,6 +555,114 @@ void SCR_DrawConsole (void)
 
 /*
 ================
+Полоса загрузки (порт VDAC4, 26.11.2026; пользователь: «между уровнями под Loading добавить прогресс-бар,
+на ширину надписи Loading»)
+
+Пока поднята плашка, экран у id не обновляется вовсе. Здесь этапы загрузки зовут SCR_LoadingProgress
+(этап, сделано, всего), и раз в ~100 мс, если полоса подросла хоть на точку, рисуется кадр: чёрный экран,
+надпись LOADING в середине и под ней полоса её ширины. Кадр целиком, а не одна полоса: у ядра «бомж-3D»
+два буфера кадра (FRAME меняет их), и во втором лежит старый кадр.
+
+Этапы и их доли полосы (доли — по замеру Unreal NG, pak с карты Evo, смена уровня демо: карта 34 с, звуки
+40, мир 30, модели 26, остальное 2,5; уточняются строкой «loading … ms» в журнале в конце загрузки):
+  LS_MAP    — от плашки до звуков: сервер, карта столкновений — CM_LoadMap, по прочитанным байтам карты;
+  LS_SOUNDS — S_EndRegistration: по звукам, которых ещё нет (загруженные раньше проходят сразу);
+  LS_WORLD  — re.BeginRegistration: на ESP — по прочитанным байтам карты (Mod_Lump, ri.LoadingProgress);
+  LS_MODELS — модели CL_PrepRefresh;
+  LS_REST   — картинки, игроки, небо, EndRegistration.
+Доля не убывает; этапы идут только вперёд. scr_loadbar 0 — полосы нет (кадры как у id).
+================
+*/
+cvar_t		*scr_loadbar;
+
+// доли — по плате (board_log16, флешка, две смены уровня по ~19–20 с: карта ~5, звуки 4,8–6,1, мир 4,6–6,4,
+// модели 2,2–4,0, остальное 0,4–0,7 с) и Unreal NG (карта Evo, 132 с) — близки
+static const float	ls_weight[LS_N] = { 0.26f, 0.28f, 0.28f, 0.15f, 0.03f };
+static int		ls_on;				// плашка поднята этой загрузкой
+static int		ls_stage;
+static float	ls_frac;			// доля полосы (не убывает)
+static int		ls_drawn;			// сколько точек полосы закрашено на экране (-1 — кадра ещё не было)
+static int		ls_draw_ms;
+static int		ls_time[LS_N + 1];	// начало каждого этапа, мс
+
+/*
+Вид полосы — как ползунок меню Q2 (qmenu.c Slider_Draw): рельс из знаков шрифта conchars — 128 (левый край),
+129 (середина), 130 (правый край), бронзовая трубка высотой 8 точек с тёмной прорезью в строках 3–4
+(от 6-й точки левого края до 6-й с конца правого). Прорезь заполняется серым, как буквы плашки LOADING
+(пользователь: янтарь «желтый яркий. Попробуй серый — цвета плашки Loading»): сверху 12 (187,187,187), снизу
+8 (123,123,123). Знаков — столько, чтобы рельс был шириной в надпись LOADING.
+*/
+#define LB_SLOT_X	6		// начало прорези от края рельса, точек
+#define LB_SLOT_Y	3		// первая строка прорези
+
+static int SCR_LoadingBarChars (int w)
+{
+	int	n = (w + 4) / 8;	// ширина надписи, округлённая до знаков
+
+	return n < 3 ? 3 : n;
+}
+
+static void SCR_DrawLoadingBar (int fill, int w, int h)
+{
+	int	x = (viddef.width - w) / 2, y = (viddef.height - h) / 2;
+	int	n = SCR_LoadingBarChars (w), bx = (viddef.width - 8 * n) / 2, by = y + h + 3, i;
+
+	re.BeginFrame (0);
+	re.DrawFill (0, 0, viddef.width, viddef.height, 0);		// чёрный
+	re.DrawPic (x, y, "loading");
+	re.DrawChar (bx, by, 128);
+	for (i = 1; i < n - 1; i++)
+		re.DrawChar (bx + 8 * i, by, 129);
+	re.DrawChar (bx + 8 * (n - 1), by, 130);
+	if (fill > 0)
+	{
+		re.DrawFill (bx + LB_SLOT_X, by + LB_SLOT_Y, fill, 1, 12);
+		re.DrawFill (bx + LB_SLOT_X, by + LB_SLOT_Y + 1, fill, 1, 8);
+	}
+	re.EndFrame ();
+}
+
+void SCR_LoadingProgress (int stage, int done, int total)
+{
+	float	f;
+	int		i, w, h, fill, now;
+
+	if (!ls_on || stage < 0 || stage >= LS_N || stage < ls_stage)
+		return;
+	now = Sys_Milliseconds ();
+	while (ls_stage < stage)
+		ls_time[++ls_stage] = now;
+	for (f = 0, i = 0; i < stage; i++)
+		f += ls_weight[i];
+	if (total > 0)
+		f += ls_weight[stage] * (done < total ? done : total) / total;
+	if (f > ls_frac)
+		ls_frac = f;
+	if (!scr_loadbar->value || !cls.disable_screen)
+		return;
+	re.DrawGetPicSize (&w, &h, "loading");
+	if (w < 3)
+		return;
+	i = 8 * SCR_LoadingBarChars (w) - 2 * LB_SLOT_X;		// длина прорези рельса
+	fill = (int)(ls_frac * i);
+	if (fill > i)
+		fill = i;
+	if (fill == ls_drawn || (ls_drawn >= 0 && now - ls_draw_ms < 100))
+		return;
+	SCR_DrawLoadingBar (fill, w, h);
+	ls_drawn = fill;
+	ls_draw_ms = now;
+}
+
+/* Для рендера (ri.LoadingProgress): чтение файла карты рендером — этап LS_WORLD */
+void SCR_LoadingWorldProgress (int done, int total)
+{
+	if (ls_stage == LS_WORLD)
+		SCR_LoadingProgress (LS_WORLD, done, total);
+}
+
+/*
+================
 SCR_BeginLoadingPlaque
 ================
 */
@@ -577,6 +686,12 @@ void SCR_BeginLoadingPlaque (void)
 	SCR_UpdateScreen ();
 	cls.disable_screen = Sys_Milliseconds ();
 	cls.disable_servercount = cl.servercount;
+	ls_on = 1;						// порт VDAC4: полоса загрузки
+	ls_stage = LS_MAP;
+	ls_frac = 0;
+	ls_drawn = -1;
+	ls_time[LS_MAP] = Sys_Milliseconds ();
+	SCR_LoadingProgress (LS_MAP, 0, 1);
 }
 
 /*
@@ -586,6 +701,19 @@ SCR_EndLoadingPlaque
 */
 void SCR_EndLoadingPlaque (void)
 {
+	if (ls_on)
+	{
+		// порт VDAC4: сколько шёл каждый этап — по этим числам подбираются доли полосы (ls_weight)
+		int	i, now = Sys_Milliseconds ();
+
+		for (i = ls_stage + 1; i <= LS_N; i++)
+			ls_time[i] = now;
+		Com_Printf ("loading %i ms: map %i, sounds %i, world %i, models %i, rest %i\n", now - ls_time[LS_MAP],
+		            ls_time[LS_SOUNDS] - ls_time[LS_MAP], ls_time[LS_WORLD] - ls_time[LS_SOUNDS],
+		            ls_time[LS_MODELS] - ls_time[LS_WORLD], ls_time[LS_REST] - ls_time[LS_MODELS],
+		            ls_time[LS_N] - ls_time[LS_REST]);
+		ls_on = 0;
+	}
 	cls.disable_screen = 0;
 	Con_ClearNotify ();
 }
@@ -1274,10 +1402,13 @@ void SCR_UpdateScreen (void)
 	// do nothing at all
 	if (cls.disable_screen)
 	{
-		if (Sys_Milliseconds() - cls.disable_screen > 120000)
+		// порт VDAC4 (25.11.2026): уровень с карты Evo грузится дольше двух минут — у id заставка тогда
+		// снималась посреди загрузки и на экране оставалось «Loading plaque timed out.». Порог — 10 минут
+		// (только на случай зависшей загрузки), сообщение — лишь в отладочный вывод.
+		if (Sys_Milliseconds() - cls.disable_screen > 600000)
 		{
 			cls.disable_screen = 0;
-			Com_Printf ("Loading plaque timed out.\n");
+			Com_DPrintf ("Loading plaque timed out.\n");
 		}
 		return;
 	}
@@ -1373,6 +1504,7 @@ void SCR_UpdateScreen (void)
 
 			V_RenderView ( separation[i] );
 
+			Q2M_BEGIN(Q2M_C_2D);	// порт VDAC4: замер — 2D поверх кадра (q2m.h)
 			SCR_DrawStats ();
 			if (cl.frame.playerstate.stats[STAT_LAYOUTS] & 1)
 				SCR_DrawLayout ();
@@ -1395,7 +1527,8 @@ void SCR_UpdateScreen (void)
 			M_Draw ();
 
 			SCR_DrawLoading ();
+			Q2M_END(Q2M_C_2D);
 		}
 	}
-	re.EndFrame();
+	Q2M_BEGIN(Q2M_C_END); re.EndFrame(); Q2M_END(Q2M_C_END);	// порт VDAC4: замер (q2m.h)
 }

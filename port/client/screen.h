@@ -29,6 +29,13 @@ void	SCR_CenterPrint (char *str);
 void	SCR_BeginLoadingPlaque (void);
 void	SCR_EndLoadingPlaque (void);
 
+// порт VDAC4 (26.11.2026): полоса загрузки под надписью LOADING — этапы (cl_scrn.c)
+#define SCR_HAS_LOADBAR 1	// measure/vid_q2m.c собирается и с исходниками id, где полосы нет
+enum { LS_MAP, LS_SOUNDS, LS_WORLD, LS_MODELS, LS_REST, LS_N };
+extern struct cvar_s	*scr_loadbar;
+void	SCR_LoadingProgress (int stage, int done, int total);
+void	SCR_LoadingWorldProgress (int done, int total);
+
 void	SCR_DebugGraph (float value, int color);
 
 void	SCR_TouchPics (void);

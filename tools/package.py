@@ -9,8 +9,9 @@
     1. находит на карте Evo папку, где лежат копия Q2.ELF и PAK0.PAK (папку помнит ESP — path.cfg);
     2. шлёт в ESP ядро (флаг 2: Evo → ESP32 → LINK → BL616 → ПЛИС, мимо microSD Tang — правило
        пользователя 23.11), потом ELF;
-    3. pak-файлы: есть флешка USB у ESP — копирует их туда один раз (/SYSTEM/CACHE/Q2/), нет флешки
-       (прошивка 0.1.166) — оставляет на карте и, пока игра идёт, отдаёт ESP их куски по запросу;
+    3. pak-файлы ставит на учёт (прошивка 0.1.167+ на флешку их не копирует) и, пока игра идёт, отдаёт ESP
+       их куски по запросу; с прошивкой 0.1.175+ pak, который пользователь сам положил на флешку USB в любую
+       папку внутри /SYSTEM/CACHE, читается оттуда (все pak — из одной папки);
     4. APP_START — Q2.ELF грузит ядро и начинает игру; любая клавиша Evo — выход (ввода пока нет).
   Q2.ELF и Q2.BIN рядом с SPG — копии: по Q2.ELF запускатель узнаёт папку, Q2.BIN — для справки.
   pak-файлы в пакет не входят: это файлы id Software, их кладёт сам владелец игры (полная версия —
@@ -45,6 +46,7 @@ STAGE = Path(r'E:\zx\cache\tmp\q2esp\package')
 # Ядро 0.03 (24.11.2026): FIFO_FREE в коде Грея (LINK 0x1C), запись цвета в F без adv — тайминг
 DEFAULT_CORE = ROOT / 'gpu' / 'rtl' / 'release' / '0.03' / 'Q2.BIN'
 DIST = ROOT / 'dist' / 'Q2'
+SPG_NAME = '_Q2.SPG'              # имя запускателя на карте Evo (первым в списке Wild Commander)
 
 
 def check_core(bits: bytes) -> str:
@@ -89,12 +91,24 @@ def sha(path: Path) -> str:
 
 
 def main() -> int:
+    global STAGE, DIST
     ap = argparse.ArgumentParser()
     ap.add_argument('--core', type=Path, default=DEFAULT_CORE)
     ap.add_argument('--elf', type=Path, default=ROOT / 'build' / 'esp' / 'Q2.ELF')
+    # горячий модуль (26.11.2026): по умолчанию — Q2HOT.ELF рядом с Q2.ELF (esp/build.ps1 кладёт его туда);
+    # «-» — пакет без модуля
+    ap.add_argument('--hot', default='')
+    ap.add_argument('--dist', type=Path, default=DIST)
+    ap.add_argument('--stage', type=Path, default=STAGE)
     ap.add_argument('--paks', default='PAK0.PAK,PAK1.PAK,PAK2.PAK')
     a = ap.parse_args()
     paks = [p.strip().upper() for p in a.paks.split(',') if p.strip()]
+    STAGE, DIST = a.stage, a.dist
+    hot_src = None if a.hot == '-' else Path(a.hot) if a.hot else a.elf.parent / 'Q2HOT.ELF'
+    if hot_src is not None and not hot_src.exists():
+        if a.hot:
+            raise SystemExit(f'нет {hot_src}')
+        hot_src = None
 
     env = dict(os.environ, TMP=str(STAGE.parent), TEMP=str(STAGE.parent), SJASMPLUS=str(SJASM))
     shutil.rmtree(STAGE, ignore_errors=True)
@@ -105,9 +119,14 @@ def main() -> int:
     copy(a.elf, elf)
     copy(a.core, core)
     mark = check_core(core.read_bytes())
+    # горячий модуль — в SPG за ELF и ядром (ESP App SPG: аргумент «+МОДУЛЬ.ELF»), в ESP — после Q2.ELF
+    hot = []
+    if hot_src is not None:
+        copy(hot_src, STAGE / 'Q2HOT.ELF')
+        hot = ['+' + str(STAGE / 'Q2HOT.ELF')]
 
     run([sys.executable, FAT32 / 'build.py'], cwd=FAT32, env=env)          # драйвер FAT32, если устарел
-    print(run([sys.executable, SPG_SRC / 'prep.py', elf, core, *paks, '--out', STAGE / 'build'],
+    print(run([sys.executable, SPG_SRC / 'prep.py', elf, core, *hot, *paks, '--out', STAGE / 'build'],
               cwd=SPG_SRC, env=env).strip())
     shutil.copyfile(SPG_SRC / 'esp_app.asm', STAGE / 'esp_app.asm')       # INCLUDE "build/…" — рядом
     run([SJASM, '--nologo', f'--inc={VDAC4_NET / "shared" / "z80"}', f'--inc={FAT32 / "include"}',
@@ -123,25 +142,44 @@ def main() -> int:
         print('spgbld оставил в _spg:', ', '.join(p.name for p in left))
 
     DIST.mkdir(parents=True, exist_ok=True)
-    for name in ('Q2.SPG', 'Q2.ELF', 'Q2.BIN'):
-        src = STAGE / 'build' / name if name == 'Q2.SPG' else STAGE / name
-        copy(src, DIST / name)
-    lines = [f'{sha(DIST / n)}  {n}  {(DIST / n).stat().st_size}' for n in ('Q2.SPG', 'Q2.ELF', 'Q2.BIN')]
+    # запускатель на карте — _Q2.SPG (25.11.2026, слово пользователя: с «_» он первый в списке файлов WC);
+    # папку игры запускатель узнаёт по Q2.ELF, имя самого SPG ему не важно
+    old_spg = DIST / 'Q2.SPG'
+    if old_spg.exists():
+        old_spg.unlink()
+    names = [SPG_NAME, 'Q2.ELF', 'Q2.BIN'] + (['Q2HOT.ELF'] if hot else [])
+    for name, src in ((SPG_NAME, STAGE / 'build' / 'Q2.SPG'), ('Q2.ELF', STAGE / 'Q2.ELF'), ('Q2.BIN', STAGE / 'Q2.BIN'),
+                      ('Q2HOT.ELF', STAGE / 'Q2HOT.ELF')):
+        if name in names:
+            copy(src, DIST / name)
+    if not hot and (DIST / 'Q2HOT.ELF').exists():
+        (DIST / 'Q2HOT.ELF').unlink()
+    lines = [f'{sha(DIST / n)}  {n}  {(DIST / n).stat().st_size}' for n in names]
     (DIST / 'SHA256.txt').write_bytes(('\n'.join(lines) + '\n').encode('ascii'))
     readme = f'''Quake 2 для VDAC4 (ZX Evolution + ESP32-S3 + Tang Nano 20K) — пакет для карты Evo
 
 На карту Evo — в одну папку (любую, кроме корня), например GAMES/QUAKE2:
-  Q2.SPG   запускатель (его и запускать из Wild Commander)
+  _Q2.SPG  запускатель (его и запускать из Wild Commander; «_» — первым в списке)
   Q2.ELF   игра для ESP (по нему запускатель узнаёт папку)
-  Q2.BIN   ядро ПЛИС «бомж-3D» (то же, что внутри Q2.SPG)
+  Q2.BIN   ядро ПЛИС «бомж-3D» (то же, что внутри _Q2.SPG)
   {"  ".join(paks)}   из папки baseq2 вашей копии Quake 2 (в пакет не входят)
-
+{"""  Q2HOT.ELF  горячий код рендера во внутреннем ОЗУ ESP (то же, что внутри _Q2.SPG; класть не обязательно)
+""" if hot else ""}
 Нужно: прошивка ESP vdac4-0.1.170 или новее. На 0.1.164–0.1.169 первая загрузка ядра Q2.BIN, которого
 ESP ещё не видела (новая версия ядра), роняет ESP — чёрный экран; исправлено в 0.1.170.
-pak читается с карты Evo по ходу игры (флешка USB у ESP для pak не используется) — загрузка уровня
-около минуты-полутора.
+pak читается с карты Evo по ходу игры — загрузка уровня около минуты-полутора.
 
-Бордюр: синий — связь и передача, зелёный — игра работает (любая клавиша — выход), красный — ошибка,
+Быстрее — с флешки USB (OTG) у ESP, прошивка ESP vdac4-0.1.175 или новее: положите pak-файлы на флешку
+сами (с ПК) в любую папку внутри /SYSTEM/CACHE, например /SYSTEM/CACHE/Q2 или /SYSTEM/CACHE/GAMES/QUAKE2.
+Если там есть файл с тем же именем, игра читает его с флешки, а не с карты Evo. Все pak одной игры — в
+одной папке: демо и полная версия не смешиваются, файл из другой папки не берётся. Ни игра, ни прошивка
+на флешку ничего не копируют и не пишут. Откуда читается каждый файл — в журнале ESP («data file Q2/…»).
+
+{"""Горячий код рендера (Q2HOT.ELF внутри _Q2.SPG) запускатель шлёт в ESP вслед за Q2.ELF, прошивка кладёт его во
+внутреннее ОЗУ (быстрее, чем из PSRAM). Не взяла (старая прошивка) — игра идёт и без него. В журнале ESP —
+«q2: hot module: …».
+
+""" if hot else ""}Бордюр: синий — связь и передача, зелёный — игра работает (любая клавиша — выход), красный — ошибка,
 жёлтый — прошивка ESP старше 0.1.166.
 
 Ядро: {mark}, {core.stat().st_size} байт. SHA-256 — SHA256.txt. С ядром 0.02 и новее кадры анимации

@@ -11,7 +11,11 @@
 # Во все файлы Quake 2 подставляются compat.h (недостающая libc модуля) и measure/q2m.h (метки замера).
 
 set(Q2 "${Q2_ROOT}/port")
-set(GEN "${Q2_ROOT}/build/esp/gen/ref_esp")
+if(DEFINED Q2_GEN)
+    set(GEN "${Q2_GEN}")        # build.ps1 -Out: своя папка вывода
+else()
+    set(GEN "${Q2_ROOT}/build/esp/gen/ref_esp")
+endif()
 
 set(ENGINE
     client/cl_cin.c client/cl_ents.c client/cl_fx.c client/cl_input.c client/cl_inv.c client/cl_main.c
@@ -23,7 +27,7 @@ set(ENGINE
     server/sv_ccmds.c server/sv_ents.c server/sv_game.c server/sv_init.c server/sv_main.c server/sv_send.c
     server/sv_user.c server/sv_world.c
     game/q_shared.c game/m_flash.c
-    null/cd_null.c null/snddma_null.c)
+    null/cd_null.c)
 list(TRANSFORM ENGINE PREPEND "${Q2}/")
 
 file(GLOB GAME "${Q2}/game/*.c")
@@ -34,7 +38,8 @@ list(APPEND REF "${Q2_ROOT}/gpu/front/bz_front.c" "${CMAKE_CURRENT_LIST_DIR}/swi
 
 # compat.c — сама замена libc: compat.h подключает себе сам, с Q2ESP_COMPAT_IMPL (без макросов-подмен);
 # подставлять его ключом -include ей нельзя — макросы встали бы раньше её #define
-set(PLATFORM q2_app.c sys_esp.c vid_esp.c in_esp.c net_esp.c store_esp.c bz_link.c)
+# snddma_esp.c — вывод звука прошивки (pcm_write) вместо null/snddma_null.c (25.11.2026)
+set(PLATFORM q2_app.c sys_esp.c vid_esp.c in_esp.c net_esp.c store_esp.c bz_link.c snddma_esp.c)
 
 idf_component_register(SRCS ${PLATFORM} compat.c ${ENGINE} ${GAME} ${REF}
                        INCLUDE_DIRS "." "${Q2_ROOT}/measure")
@@ -45,17 +50,23 @@ set(FORCE "-include;${CMAKE_CURRENT_LIST_DIR}/compat.h;-include;${Q2_ROOT}/measu
 set(QUIET "-Wno-error;-w;-fpermissive;-Wno-incompatible-pointer-types;-Wno-int-conversion;-Wno-implicit-function-declaration;-Wno-implicit-int;-Wno-return-mismatch")
 
 set_source_files_properties(${ENGINE} ${PLATFORM} PROPERTIES COMPILE_OPTIONS "${FORCE}")
-set_source_files_properties(${ENGINE} PROPERTIES COMPILE_OPTIONS "${FORCE};${QUIET}")
+# -fsingle-precision-constant (26.11.2026): литерал без f (0.5, 0.01, 1.0 / …) у id делает выражение float
+# double, а у ESP32-S3 FPU только float — double считается программно (профиль Unreal NG: ~40 % времени кадра в
+# __muldf3/__adddf3 из ПЗУ). Движку, рендеру и игре (физика) — литералы float.
+set(SPC "-fsingle-precision-constant")
+set_source_files_properties(${ENGINE} PROPERTIES COMPILE_OPTIONS "${FORCE};${QUIET};${SPC}")
 set_source_files_properties(${GAME} PROPERTIES COMPILE_OPTIONS
-    "${FORCE};${QUIET};-Ddedicated=game_dedicated;-Dmaxclients=game_maxclients")
+    "${FORCE};${QUIET};${SPC};-Ddedicated=game_dedicated;-Dmaxclients=game_maxclients")
 set_source_files_properties(${REF} PROPERTIES COMPILE_OPTIONS
-    "${FORCE};${QUIET};-Dvid_fullscreen=r_vid_fullscreen;-Dvid_gamma=r_vid_gamma;-DBZ_ONLY;-DBZ_ESP;-DBZ_TEX_RESIDENT;-I${GEN};-I${Q2}/ref_soft;-I${Q2_ROOT}/gpu/front;-I${Q2_ROOT}/gpu/model")
+    "${FORCE};${QUIET};${SPC};-Dvid_fullscreen=r_vid_fullscreen;-Dvid_gamma=r_vid_gamma;-DBZ_ONLY;-DBZ_ESP;-DBZ_TEX_RESIDENT;-I${GEN};-I${Q2}/ref_soft;-I${Q2_ROOT}/gpu/front;-I${Q2_ROOT}/gpu/model")
 
 # NDEBUG — как у сборки ПК (measure/build.py): assert id выключены
 # MAX_PARTICLES 3072 (у id 4096), CON_TEXTSIZE 8192 (у id 32768) — «диета» памяти, как у q2esp.exe на ПК
 # (там поток сверен с ref_bz: demo1, demo2, бои base1 и city3 — кадр в кадр)
+# Q2_SND_STORE — отсчёты звуков в хранилище SDRAM ядра (snd_mem.c, snd_mix.c), как у q2esp.exe на ПК
 target_compile_definitions(${COMPONENT_LIB} PRIVATE C_ONLY NDEBUG GAME_HARD_LINKED REF_HARD_LINKED
-                           MAX_PARTICLES=3072 CON_TEXTSIZE=8192)
+                           MAX_PARTICLES=3072 CON_TEXTSIZE=8192 Q2_SND_STORE
+                           Q2_ESP_TARGET)   # сборка для ESP (не ПК): Com_PageInMemory — пустая
 # -fno-common: одноимённые глобальные переменные частей — ошибка связывания, а не тихое слияние
 target_compile_options(${COMPONENT_LIB} PRIVATE -std=gnu11 -O2 -fno-strict-aliasing -fwrapv -fno-common
                        -fstack-usage)

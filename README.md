@@ -14,7 +14,7 @@ Tang Nano 20K FPGA draws them with its own 3D core and outputs HDMI. Game data (
 | `esp/` | Q2.ELF — исполняемый файл FreeRTOS для ESP32-S3: игра, связь с ПЛИС, картинка, клавиатура, файлы | GPL v2 (`esp/COPYING`) |
 | `gpu/front/` | связка рендера Quake II с ядром ПЛИС | GPL v2 (`gpu/front/COPYING`) |
 | `measure/` | сборка Quake II на ПК для замеров памяти и времени, заплатки рендера | GPL v2 (`measure/COPYING`) |
-| `dist/Q2/` | готовый пакет: Q2.SPG (запускатель), Q2.ELF, Q2.BIN | GPL v2 (`dist/COPYING`) |
+| `dist/Q2/` | готовый пакет: _Q2.SPG (запускатель), Q2.ELF, Q2.BIN | GPL v2 (`dist/COPYING`) |
 | `gpu/rtl/` | ядро ПЛИС «бомж-3D» (SystemVerilog, Gowin), стенды Verilator, выпуски `release/` | MIT (`LICENSE`) |
 | `gpu/model/`, `gpu/SPEC.md` | модель ядра на C и формат команд | MIT |
 | `tools/` | сборка пакета, разбор трасс и замеров | MIT |
@@ -28,7 +28,10 @@ Q2.ELF собирается из `port/` и `esp/`, поэтому он и па�
 - ZX Evolution с VDAC4, карта Evo с Wild Commander;
 - прошивка ESP VDAC4 **0.1.170 или новее** (на 0.1.164–0.1.169 первая загрузка нового ядра роняет ESP);
 - `PAK0.PAK`, `PAK1.PAK` (и `PAK2.PAK`, если есть) из папки `baseq2` вашей копии Quake II — в одну папку с
-  Q2.SPG и Q2.ELF (см. `dist/Q2/README.txt`).
+  _Q2.SPG и Q2.ELF (см. `dist/Q2/README.txt`);
+- по желанию, с прошивкой ESP **0.1.175 или новее**: те же pak на флешке USB (OTG) у ESP в любой папке внутри
+  `/SYSTEM/CACHE` (все в одной папке) — тогда они читаются с флешки, быстрее, чем с карты Evo. Игра и прошивка на
+  флешку ничего не копируют.
 
 ## Состояние
 

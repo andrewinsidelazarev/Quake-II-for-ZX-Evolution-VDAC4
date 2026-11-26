@@ -110,6 +110,20 @@ static inline int q2_ispunct (int c) { return q2_isprint (c) && c != ' ' && !q2_
  * (cl.time, level.time) не трогают */
 #undef toupper
 #undef tolower
+/* Математика — во float (26.11.2026). Quake 2 зовёт sin, cos, sqrt, floor … с аргументами float, а C отдаёт их
+ * функциям double: у ESP32-S3 FPU только float, double считается программно (профиль Unreal NG: __kernel_sin,
+ * __muldf3 … из ПЗУ). Версии float прошивка экспортирует (zm_symbols.cpp); fabsf GCC делает одной командой FPU.
+ * <math.h> уже подключён выше — его объявления double не задеты. */
+#define sin(_a)      sinf(_a)
+#define cos(_a)      cosf(_a)
+#define tan(_a)      tanf(_a)
+#define atan(_a)     atanf(_a)
+#define atan2(_a,_b) atan2f(_a,_b)
+#define sqrt(_a)     sqrtf(_a)
+#define floor(_a)    floorf(_a)
+#define ceil(_a)     ceilf(_a)
+#define fabs(_a)     fabsf(_a)
+
 #define malloc(_a) q2_malloc(_a)
 #define calloc(_a,_b) q2_calloc(_a,_b)
 #define realloc(_a,_b) q2_realloc(_a,_b)

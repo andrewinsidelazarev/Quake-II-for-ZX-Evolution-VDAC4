@@ -646,6 +646,17 @@ Loads in the map and all submodels
 // Порт VDAC4 («диета», шаг 3): lump карты — из файла в свой буфер, разбор загрузчиком id (он берёт данные по
 // cmod_base + l->fileofs — cmod_base сдвигается так, что это и есть буфер lump-а), буфер — сразу прочь.
 // Пик памяти — самый большой lump, а не весь файл карты.
+// Порт VDAC4 (26.11.2026): полоса загрузки под LOADING (cl_scrn.c) — ход чтения файла карты: проверочная сумма
+// (файл целиком) и lump-ы. Этап LS_MAP = 0 (client/screen.h).
+void SCR_LoadingProgress (int stage, int done, int total);
+static int	cm_read, cm_total;
+
+static void CM_Progress (int len)
+{
+	cm_read += len;
+	SCR_LoadingProgress (0, cm_read, cm_total);
+}
+
 static void CM_Lump (FILE *f, int base, void (*load) (lump_t *l), lump_t *l)
 {
 	// порт VDAC4: на ESP буфер — сверху области уровня (CM_LevelScratchHook), иначе — зона, как раньше
@@ -664,6 +675,7 @@ static void CM_Lump (FILE *f, int base, void (*load) (lump_t *l), lump_t *l)
 	cmod_base = NULL;
 	if (!CM_LevelScratchFreeHook || !CM_LevelScratchFreeHook (part))
 		FS_FreeFile (part);
+	CM_Progress (l->filelen);
 }
 
 /*
@@ -754,6 +766,8 @@ cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 	if (!f)
 		Com_Error (ERR_DROP, "Couldn't load %s", name);
 	base = ftell (f);
+	cm_read = 0;
+	cm_total = length * 2;		// порт VDAC4: полоса — сумма (файл целиком) и lump-ы (оценка: ещё столько же)
 	Com_PartialChecksumBegin ();
 	for (at = 0 ; at < length ; at += n)
 	{
@@ -761,6 +775,7 @@ cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 		buf = FS_ReadPart (f, base, at, n);
 		Com_PartialChecksumAdd (buf, n);
 		FS_FreeFile (buf);
+		CM_Progress (n);
 	}
 	last_checksum = LittleLong (Com_PartialChecksumEnd ());
 	*checksum = last_checksum;
@@ -780,6 +795,13 @@ cmodel_t *CM_LoadMap (char *name, qboolean clientload, unsigned *checksum)
 	CM_AllocTables (&header);	// порт VDAC4: таблицы по размеру карты
 
 	// load into heap — порт VDAC4: по lump-у, в том же порядке, что у id
+	// порт VDAC4: полоса загрузки — теперь известно, сколько читать lump-ами
+	cm_total = length + header.lumps[LUMP_TEXINFO].filelen + header.lumps[LUMP_LEAFS].filelen +
+		header.lumps[LUMP_LEAFBRUSHES].filelen + header.lumps[LUMP_PLANES].filelen +
+		header.lumps[LUMP_BRUSHES].filelen + header.lumps[LUMP_BRUSHSIDES].filelen +
+		header.lumps[LUMP_MODELS].filelen + header.lumps[LUMP_NODES].filelen + header.lumps[LUMP_AREAS].filelen +
+		header.lumps[LUMP_AREAPORTALS].filelen + header.lumps[LUMP_VISIBILITY].filelen +
+		header.lumps[LUMP_ENTITIES].filelen;
 	CM_Lump (f, base, CMod_LoadSurfaces, &header.lumps[LUMP_TEXINFO]);
 	CM_Lump (f, base, CMod_LoadLeafs, &header.lumps[LUMP_LEAFS]);
 	CM_Lump (f, base, CMod_LoadLeafBrushes, &header.lumps[LUMP_LEAFBRUSHES]);

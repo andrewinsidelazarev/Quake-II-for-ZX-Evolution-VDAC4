@@ -140,6 +140,9 @@ void VID_Init (void)
 	ri.Vid_GetModeInfo = VID_GetModeInfo;
 	ri.Vid_MenuInit = VID_MenuInit;
 	ri.Vid_NewWindow = VID_NewWindow;
+#ifdef SCR_HAS_LOADBAR		// наш движок (port): полоса загрузки (cl_scrn.c, 26.11.2026); у id её нет
+	ri.LoadingProgress = SCR_LoadingWorldProgress;
+#endif
 
 	re = GetRefAPI (ri);
 	if (re.api_version != API_VERSION)

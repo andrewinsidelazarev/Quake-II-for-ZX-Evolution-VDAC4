@@ -57,6 +57,11 @@ int R_EspPurgeStale (void);
 void R_EspPurgeStats (int *count, unsigned *bytes);
 uint32_t BZ_StoreBytes (void);   /* bz_front.c: сколько байт хранилища в SDRAM ядра занято (кадры md2) */
 uint32_t BZ_CmdBufBytes (void);  /* bz_front.c: сколько PSRAM держат буферы команд кадра и неба */
+void BZ_AllocCmdBuffers (void);  /* bz_front.c: буферы команд — после области уровня, до первой карты  */
+int BZ_ReleaseSpare (void);      /* bz_front.c: отдать запасной буфер кадра (1 — отдан, 0 — нечего)    */
+/* compat.c: памяти нет — освободить что можно: модель прошлой карты (R_EspPurgeStale), иначе запасной буфер
+ * кадра (BZ_ReleaseSpare). 1 — что-то освобождено, можно пробовать снова. */
+int q2_mem_reclaim (void);
 
 /* ---------------------------------------------------------------- файлы в памяти (compat.c) */
 /* Перебор файлов в памяти по образцу «save/current/» + «*» + «.sav» (для Sys_FindFirst): *iter — с 0;

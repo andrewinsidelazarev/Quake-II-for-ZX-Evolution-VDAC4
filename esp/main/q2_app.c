@@ -53,21 +53,110 @@ void q2_esp_exit (int code)
 	longjmp (exit_jmp, 1);
 }
 
+#define Q2M_TICKS_PER_US 240     /* частота ядра ESP32-S3, МГц */
+
+/*
+ * Счётчики производительности Xtensa на ядре игры (26.11.2026): куда уходят такты. Unreal NG исполняет
+ * 240 команд за мкс без задержек памяти, и в нём рендер втрое-вчетверо быстрее, чем на плате, — похоже,
+ * на плате ядро в основном ждёт PSRAM (кэш команд 16 КБ, данных 32 КБ). Два счётчика (PM0, PM1) отладочного
+ * блока ядра, доступ — командами RER/WER (регистры ERI, xtensa-debug-module.h ESP-IDF). Каждые 5 с — другая
+ * пара событий, по кругу: стоянки из-за промаха кэша команд и данных; все стоянки команд и данных;
+ * исполненные команды и «пузыри» конвейера. В Unreal NG команд RER/WER нет — там замер выключен (строка
+ * прошивки «…unreal-ng…»).
+ */
+#define PM_PGM     0x101000u    /* ERI_PERFMON_PGM: бит 0 — счёт включён */
+#define PM_COUNT0  0x101080u    /* ERI_PERFMON_PM0 (+4 — PM1) */
+#define PM_CTRL0   0x101100u    /* ERI_PERFMON_PMCTRL0: выбор события << 8, маска << 16, TRACELEVEL << 4 */
+
+static uint32_t pm_read (uint32_t a)
+{
+	uint32_t v;
+	__asm__ volatile ("rer %0, %1" : "=a"(v) : "a"(a));
+	return v;
+}
+
+static void pm_write (uint32_t a, uint32_t v)
+{
+	__asm__ volatile ("wer %0, %1" : : "a"(v), "a"(a) : "memory");
+}
+
+static void perf_report (int ms)
+{
+	/* {событие, маска} для PM0 и PM1 — xt_perf_consts.h */
+	static const uint16_t cfg[3][4] = {
+		{ 4, 0x0001, 3, 0x0008 },      /* стоянка: промах кэша команд | промах кэша данных */
+		{ 4, 0x01FF, 3, 0x01FE },      /* все стоянки команд | все стоянки данных           */
+		{ 2, 0x8DFF, 6, 0x01FD },      /* исполнено команд | пузыри конвейера               */
+	};
+	static const char *what[3][2] = { { "I-cache miss stall", "D-cache miss stall" },
+	                                  { "all I stall", "all D stall" }, { "instructions", "bubbles" } };
+	static int  state = -1;            /* -1 — не заводили; 0…2 — какая пара считается сейчас */
+	uint64_t    c0, c1, cycles = (uint64_t)ms * 240000u;
+	int         k;
+
+	if (state == -2 || !q2_core->firmware || strstr (q2_core->firmware, "unreal"))
+	{
+		state = -2;
+		return;
+	}
+	if (state >= 0 && cycles && ms < 15000)    /* дольше — 32-битный счётчик мог перевалить */
+	{
+		c0 = pm_read (PM_COUNT0);
+		c1 = pm_read (PM_COUNT0 + 4);
+		q2_core->log ("q2: cpu1 %u ms: %s %u.%u%%, %s %u.%u%% of cycles", (unsigned)ms,
+		              what[state][0], (unsigned)(c0 * 100u / cycles), (unsigned)(c0 * 1000u / cycles % 10u),
+		              what[state][1], (unsigned)(c1 * 100u / cycles), (unsigned)(c1 * 1000u / cycles % 10u));
+	}
+	state = (state + 1) % 3;
+	pm_write (PM_PGM, 0);
+	for (k = 0; k < 2; k++)
+	{
+		/* TRACELEVEL 15 без KRNLCNT: считать при любом CINTLEVEL ≤ 15, то есть всегда. (KRNLCNT = 1 считает ТОЛЬКО
+		 * при CINTLEVEL > TRACELEVEL — в прерываниях; так было в board_log14: «команд 3 % тактов».) */
+		pm_write (PM_CTRL0 + 4u * k, ((uint32_t)cfg[state][2 * k] << 8) | ((uint32_t)cfg[state][2 * k + 1] << 16) | (15u << 4));
+		pm_write (PM_COUNT0 + 4u * k, 0);
+	}
+	pm_write (PM_PGM, 1);
+}
+
 /* Раз в 5 с — в журнал: кадров в секунду и среднее время частей кадра (метки Q2M_* в port/, q2m.h). */
 static void report_times (int frames, int ms)
 {
-	static const char *name[Q2M_N] = { "sv", "game", "cl", "scr", "rf", "snd" };
+	static const char *name[Q2M_N] = { "sv", "game", "cl", "scr", "rf", "snd",
+	                                   "setup", "world", "bmod", "ent", "part", "alpha", "link", "lread",
+	                                   "face", "lm", "tex", "atri", "lwait",
+	                                   "ents", "2d", "end",
+	                                   "frm", "lit", "xf", "trs", "mdl", "vert", "tri" };
 	char line[120];
 	int  i, n;
 
+	/* строки: части кадра, (с 25.11.2026) части рендера и LINK, внутри рендера и (26.11.2026) части экрана вне
+	 * рендера — журнал режет строку на 136 знаках */
 	n = snprintf (line, sizeof(line), "q2: %d.%d fps, ms/frame", frames * 10000 / ms / 10, frames * 10000 / ms % 10);
 	for (i = 0; i < Q2M_N && n < (int)sizeof(line); i++)
 	{
-		long long us = frames ? q2m_acc[i] / frames : 0;
-		n += snprintf (line + n, sizeof(line) - n, " %s %d.%d", name[i], (int)(us / 1000), (int)(us % 1000 / 100));
+		long long us = frames ? q2m_acc[i] / Q2M_TICKS_PER_US / frames : 0;   /* метки — в тактах (sys_esp.c) */
+		if (i == Q2M_R_SETUP || i == Q2M_F_FACE || i == Q2M_C_ENTS || i == Q2M_A_FRM)
+		{
+			q2_core->log ("%s", line);
+			n = snprintf (line, sizeof(line), i == Q2M_R_SETUP ? "q2: rf parts, ms/frame" :
+			              i == Q2M_F_FACE ? "q2: rf inside, ms/frame" :
+			              i == Q2M_C_ENTS ? "q2: scr parts, ms/frame" : "q2: ent parts, ms/frame");
+		}
+		if (i >= Q2M_K_MDL)        /* 26.11.2026: счёт (моделей, вершин, треугольников) за кадр, а не такты */
+			n += snprintf (line + n, sizeof(line) - n, " %s %d", name[i], frames ? (int)(q2m_acc[i] / frames) : 0);
+		else
+			n += snprintf (line + n, sizeof(line) - n, " %s %d.%d", name[i], (int)(us / 1000), (int)(us % 1000 / 100));
 		q2m_acc[i] = 0;
 	}
 	q2_core->log ("%s", line);
+	{
+		void bz_link_report (int frames); /* bz_link.c: поток в ядро и ожидание места в его очереди */
+		void snd_esp_report (void);       /* snddma_esp.c: звук за эти 5 с (если он запущен) */
+		bz_link_report (frames);
+		snd_esp_report ();
+	}
+	perf_report (ms);
 }
 
 static void game_task (void *arg)
@@ -79,7 +168,10 @@ static void game_task (void *arg)
 	 * 90 с на сложности 3, results/edicts): выше 800 — только space (912), но она по памяти ESP не
 	 * помещается и так; дальше всех — security и power2 (750), command (688). */
 	static char *argv[] = { "q2", "+set", "basedir", "q2", "+set", "sw_mode", "12",
-	                        "+set", "maxentities", "800", NULL };
+	                        "+set", "maxentities", "800",
+	                        /* звук смешивается на 0,3 с вперёд (у id 0,2): кадр на плате бывает 0,3–0,5 с,
+	                         * и с 0,2 звук рвался тишиной (плата 25.11, «q2: sound: … silence») */
+	                        "+set", "s_mixahead", "0.3", NULL };
 	/* static: переменные, изменённые после setjmp, longjmp может испортить (так говорит стандарт C) */
 	static uint32_t version;
 	static int      last, now, report, frames;
@@ -90,10 +182,13 @@ static void game_task (void *arg)
 		if (bz_link_open (&version) != ZM_OK)
 			q2_esp_exit (2);
 		q2_core->log ("q2: core on LINK, version %08x", (unsigned)version);
+		/* адрес кода — для перевода адреса сбоя в функцию по отладочной копии ELF (25.11.2026) */
+		q2_core->log ("q2: code anchor game_task %p", (void *)game_task);
 		q2_mem_report ("before init");
 		Qcommon_Init ((int)(sizeof(argv) / sizeof(argv[0])) - 1, argv);   /* без последнего NULL */
 		q2_mem_report ("after init");
 		q2_level_init ();               /* область уровня — пока куча сплошная, до первой карты (sys_esp.c) */
+		BZ_AllocCmdBuffers ();          /* буферы команд — следом, внизу кучи, до первой карты (bz_front.c) */
 		last = report = Sys_Milliseconds ();
 		for (;;)
 		{
@@ -143,6 +238,58 @@ static int firmware_at_least (const char *fw, unsigned least)
 	return a > 0 || b > 1 || (b == 1 && c >= least);
 }
 
+/*
+ * Горячий модуль Q2HOT.ELF (26.11.2026, пользователь: «Да, переноси»; esp/hot/q2hot.c, gpu/front/bz_int.h).
+ * На плате ~22 % тактов ядро игры ждёт выборки команд из PSRAM (board_log15). Самые частые функции переднего
+ * края (грань мира, треугольники моделей, частицы) прошивка кладёт во внутреннее ОЗУ (code_ram, ABI 1.19) —
+ * целым модулем, который присылает запускатель (ESP App SPG: «+Q2HOT.ELF»). Нет прошивки 0.1.157+, нет файла,
+ * не лёг во внутреннее ОЗУ, не той версии — игра идёт на своих копиях этих функций, как раньше.
+ */
+static void *hot_handle;
+void BZ_HotTables (void **imp, void **exp);    /* gpu/front/bz_front.c */
+int  BZ_HotUse (int on);
+
+static void hot_load (const zm_core_t *core)
+{
+	static const uint32_t want[] = { 16u * 1024u, 8u * 1024u };
+	uint32_t got = 0, placed = 0;
+	void    *imp, *exp;
+	int      r = ZM_ERROR, entry = -99;
+	unsigned i;
+
+	if (core->abi_minor < 19 || core->size < offsetof (zm_core_t, module_open_ex) + sizeof(core->module_open_ex))
+	{
+		core->log ("q2: hot module: firmware without code_ram (ABI 1.%u) — hot code stays in PSRAM", core->abi_minor);
+		return;
+	}
+	for (i = 0; i < sizeof(want) / sizeof(want[0]) && r != ZM_OK; i++)
+		r = core->code_ram (want[i], &got);
+	if (r != ZM_OK)
+	{
+		core->log ("q2: hot module: code_ram refused (%d) — hot code stays in PSRAM", r);
+		return;
+	}
+	BZ_HotTables (&imp, &exp);
+	r = core->module_open_ex ("Q2HOT.ELF", ZM_MODULE_TEXT_INTERNAL, imp, exp, &hot_handle, &entry, &placed);
+	if (r != ZM_OK)
+	{
+		core->log ("q2: hot module: Q2HOT.ELF not opened (%d) — hot code stays in PSRAM", r);
+		hot_handle = NULL;
+		return;
+	}
+	if (entry != 0 || !(placed & ZM_MODULE_TEXT_INTERNAL) || !BZ_HotUse (1))
+	{
+		/* не той версии (entry < 0) или код лёг в PSRAM — толку нет, свои копии не хуже */
+		core->log ("q2: hot module: Q2HOT.ELF entry %d, %s — not used", entry,
+		           (placed & ZM_MODULE_TEXT_INTERNAL) ? "code in internal RAM" : "code in PSRAM");
+		BZ_HotUse (0);
+		core->module_close (hot_handle);
+		hot_handle = NULL;
+		return;
+	}
+	core->log ("q2: hot module: Q2HOT.ELF code in internal RAM (code_ram %u bytes)", (unsigned)got);
+}
+
 static int start (const zm_core_t *core)
 {
 	int r;
@@ -165,6 +312,7 @@ static int start (const zm_core_t *core)
 		           "pak without a USB drive)", core->firmware ? core->firmware : "?");
 		return ZM_ERROR;
 	}
+	hot_load (core);                /* code_ram — лучше всего здесь, в start (zm_app.h) */
 	q2_stop_request = 0;
 	task_running = 1;
 	r = core->task_start (game_task, NULL, Q2_STACK | ZM_TASK_STACK_PSRAM_FIRST, 1, 1);
@@ -185,6 +333,12 @@ static void stop (void)
 		q2_core->delay (10);
 	if (task_running)
 		q2_core->log ("q2: game task did not stop in 3 s");
+	else if (hot_handle)
+	{
+		BZ_HotUse (0);
+		q2_core->module_close (hot_handle);
+		hot_handle = NULL;
+	}
 }
 
 /* Команд Z80 у Quake 2 пока нет (клавиатура, мышь, загрузчик — следующие шаги). */

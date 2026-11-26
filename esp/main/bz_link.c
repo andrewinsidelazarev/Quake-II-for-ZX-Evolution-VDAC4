@@ -76,6 +76,10 @@ static int      link_ok;
 static int      can_read;          /* ядро 0.02+: чтение SDRAM по LINK (SPEC 0.4) */
 static uint32_t free_reg;          /* откуда читать место в очереди: BZ_FREE_GRAY (ядро 0.03+) или BZ_FIFO_FREE */
 static int      has_checked;       /* прошивка 0.1.168+ (ABI 1.21): есть link_read_checked */
+/* Прошивка 0.1.176+ (ABI 1.22): link_burst_dma — очередь ядра транзакциями до 512 слов через DMA (27.11.2026;
+ * плата board_log27: link_burst по 16 слов — ~1,75 слова/мкс, 8,3 мс на кадр). 1 — есть и работает; 0 — нет
+ * поля или прошивка не дала буферов (ZM_NO_MEMORY) — link_burst, как раньше. */
+static int      has_dma;
 
 /* Одно слово регистра ядра. На прошивке 0.1.168+ — link_read_checked: два чтения под одним замком LINK,
  * не совпали — третье и медиана (одно испорченное из трёх отбрасывается). Старше и в Unreal NG (ABI 1.20)
@@ -87,6 +91,11 @@ static int reg_read (uint32_t addr, uint32_t *v)
 	return q2_core->link_read (addr, v, 1);
 }
 static uint32_t sent_words, wait_ms;
+/* 26.11.2026: где время задачи LINK — в тактах (240 МГц): пачки link_burst, чтения места, ожидание места,
+ * уступка чтению SDRAM игрой; и число вызовов link_burst (строка «q2: link time» в bz_link_report) */
+static uint32_t lc_burst, lc_free, lc_wait, lc_rd, lc_nburst;
+static inline uint32_t lc_now (void) { uint32_t c; __asm__ volatile ("rsr.ccount %0" : "=a"(c)); return c; }
+static uint32_t link_free_est;      /* слов в очереди ядра наверняка свободно (0 — не знаем; link_send) */
 static uint32_t read_calls, read_bytes, read_us;   /* итоги чтения SDRAM — в журнал при закрытии */
 static uint32_t core_version;      /* VERSION ядра при открытии — эталон для проверки связи */
 static uint32_t bad_reads;         /* сколько раз LINK отдал значение, которого ядро выдать не может */
@@ -179,6 +188,7 @@ int bz_link_open (uint32_t *version)
 	check_at = q2_core->millis ();
 	last_pos = 0;
 	memset (last_sends, 0, sizeof(last_sends));
+	link_free_est = 0;
 	link_ok = 1;
 	/* ядро 0.02+ умеет отдавать SDRAM в окно (SPEC 0.4): тогда кадры md2 живут там; старое ядро — в PSRAM */
 	can_read = (v & 0xFFFFu) >= 2;
@@ -186,8 +196,11 @@ int bz_link_open (uint32_t *version)
 	has_checked = q2_core->abi_minor >= 21 &&
 	              q2_core->size >= offsetof (zm_core_t, link_read_checked) + sizeof(q2_core->link_read_checked) &&
 	              q2_core->link_read_checked != NULL;
-	q2_core->log ("q2: LINK queue space from %s, %s reads", free_reg == BZ_FREE_GRAY ? "FREE_GRAY (Gray code)"
-	              : "FIFO_FREE (binary)", has_checked ? "checked" : "plain");
+	has_dma = q2_core->abi_minor >= 22 &&
+	          q2_core->size >= offsetof (zm_core_t, link_burst_wait) + sizeof(q2_core->link_burst_wait) &&
+	          q2_core->link_burst_dma != NULL && q2_core->link_burst_wait != NULL;
+	q2_core->log ("q2: LINK queue space from %s, %s reads, %s", free_reg == BZ_FREE_GRAY ? "FREE_GRAY (Gray code)"
+	              : "FIFO_FREE (binary)", has_checked ? "checked" : "plain", has_dma ? "DMA bursts" : "16-word bursts");
 	sent_words = wait_ms = 0;
 	read_calls = read_bytes = read_us = 0;
 	link_diag ("core open");        /* образец: так проверка выглядит при исправной связи */
@@ -228,7 +241,7 @@ int bz_link_wait_mark (uint32_t mark)
  *   готова; нужные слова окна (со сдвигом addr − пачка) — по 16 за чтение LINK (больше прошивка за раз не
  *   берёт). Слово SDRAM: младший байт — младший, как у ESP. Больше окна — частями.
  */
-int bz_link_read (uint32_t addr, void *dst, uint32_t bytes)
+static int link_read_sdram (uint32_t addr, void *dst, uint32_t bytes)
 {
 	long long Q2M_Now (void);           /* микросекунды (sys_esp.c) */
 	uint8_t  *d = (uint8_t *)dst;
@@ -291,7 +304,7 @@ int bz_link_read (uint32_t addr, void *dst, uint32_t bytes)
 		read_bytes += chunk;
 	}
 	read_calls++;
-	read_us += (uint32_t)(Q2M_Now () - t0);
+	read_us += (uint32_t)((Q2M_Now () - t0) / 240);   /* такты → мкс (sys_esp.c) */
 	return ZM_OK;
 }
 
@@ -386,51 +399,313 @@ static int read_free (uint32_t *out)
 	return ZM_OK;
 }
 
-int bz_link_send (const uint32_t *words, uint32_t count)
+/*
+ * 26.11.2026 (плата board_log18, board_log19). Пачка в очередь ядра не начинается, пока игра читает SDRAM
+ * ядра (rd_active, bz_link_read): чтение — десятки мелких обращений к LINK (адрес, опрос STATUS, окно по 16
+ * слов), и каждое ждало конца пачки до 8 КБ (~1,5 мс): 2,3 чтения за кадр — 3,4 мс (с этим — 2,0).
+ * Место в очереди — своей оценкой (link_free_est): прочитанное FIFO_FREE минус отправленное — нижняя граница
+ * (ядро слова только забирает). FIFO_FREE (два чтения с проверкой — 4–6 обращений к LINK) читается, лишь когда
+ * оценки не хватает: пачки по 512 слов с чтением перед каждой (board_log19) сделали LINK медленнее, 25 → 27 мс.
+ * Очередь полна — ждать, пока освободится хотя бы LINK_MIN_FREE слов (или весь остаток), опросом раз в
+ * LINK_POLL_US до LINK_SPIN_US, потом сон на 1 мс (сон FreeRTOS не короче 1 мс, а 8 КБ очереди ядро может
+ * разобрать быстрее и стоять без команд: board_log18 — «очередь полна» 11–14 мс за кадр).
+ */
+#define LINK_MIN_FREE  512u      /* ждать хотя бы столько свободных слов, а не слать пачки по чуть-чуть */
+#define LINK_POLL_US   150u      /* шаг короткого ожидания места в очереди ядра                         */
+#define LINK_SPIN_US   1500u     /* сколько ждать коротко, прежде чем уснуть на 1 мс                    */
+#define LINK_RD_POLL_US 20u      /* шаг ожидания конца чтения SDRAM игрой                                */
+
+static volatile int rd_active;   /* 1 — игра читает SDRAM ядра (bz_link_read): задача LINK пачку не начинает */
+
+/* Подождать us микросекунд счётчиком тактов (240 МГц) — без сна: ядро ESP 0, где работает задача LINK,
+ * почти простаивает, а сон FreeRTOS — не короче 1 мс. */
+static void spin_us (uint32_t us)
 {
+	uint32_t c0, c;
+
+	__asm__ volatile ("rsr.ccount %0" : "=a"(c0));
+	do
+		__asm__ volatile ("rsr.ccount %0" : "=a"(c));
+	while (c - c0 < us * 240u);
+}
+
+static int link_send (const uint32_t *words, uint32_t count)
+{
+	uint32_t spun = 0;
+
 	stream_check ();
 	while (count)
 	{
-		uint32_t f1 = 0, f2 = 0, free_words, n, t0;
+		uint32_t f1 = 0, f2 = 0, n, t0, c0;
 
-		/* Место в очереди читаем дважды и берём меньшее. Между чтениями ядро только забирает слова, так
-		 * что второе число не меньше первого; если меньше — одно из чтений испорчено (LINK без проверки
-		 * целостности). Испорченное «больше» без второго чтения переполнило бы очередь. */
-		if (!link_ok || read_free (&f1) != ZM_OK || read_free (&f2) != ZM_OK)
+		/* игра читает SDRAM ядра — дать ей LINK (до 4 мс; чтение — доли миллисекунды) */
+		c0 = lc_now ();
+		for (t0 = 0; rd_active && t0 < 4000u / LINK_RD_POLL_US; t0++)
+			spin_us (LINK_RD_POLL_US);
+		lc_rd += lc_now () - c0;
+
+		if (!link_free_est || (link_free_est < LINK_MIN_FREE && link_free_est < count))
 		{
-			link_ok = 0;
-			return ZM_ERROR;
+			/* Место в очереди читаем дважды и берём меньшее. Между чтениями ядро только забирает слова, так
+			 * что второе число не меньше первого; если меньше — одно из чтений испорчено (LINK без проверки
+			 * целостности). Испорченное «больше» без второго чтения переполнило бы очередь.
+			 * 26.11.2026 (плата board_log27: чтения места — 7–7,7 мс задачи LINK за кадр, ~45 мкс на пару): с
+			 * link_read_checked прошивка сама читает регистр дважды и при несовпадении берёт медиану трёх — второе
+			 * наше чтение лишнее, оно только удваивало обращения к LINK. */
+			int bad;
+			c0 = lc_now ();
+			bad = !link_ok || read_free (&f1) != ZM_OK;
+			if (!bad)
+			{
+				if (has_checked)
+					f2 = f1;
+				else
+					bad = read_free (&f2) != ZM_OK;
+			}
+			lc_free += lc_now () - c0;
+			if (bad)
+			{
+				link_ok = 0;
+				return ZM_ERROR;
+			}
+			if (f2 < f1)
+				fifo_disagree++;
+			link_free_est = f1 < f2 ? f1 : f2;
+			if (link_free_est < LINK_MIN_FREE && link_free_est < count)
+			{
+				/* мало места: ядро ещё рисует — подождать (см. выше) */
+				t0 = q2_core->millis ();
+				c0 = lc_now ();
+				if (spun < LINK_SPIN_US)
+				{
+					spin_us (LINK_POLL_US);
+					spun += LINK_POLL_US;
+				}
+				else
+				{
+					q2_core->delay (1);
+					spun = 0;
+				}
+				wait_ms += q2_core->millis () - t0;
+				lc_wait += lc_now () - c0;
+				continue;
+			}
 		}
-		if (f2 < f1)
-			fifo_disagree++;
-		free_words = f1 < f2 ? f1 : f2;
-		if (!free_words)
-		{
-			/* очередь полна: ядро ещё рисует — подождать (1 мс — шаг таймера FreeRTOS) */
-			t0 = q2_core->millis ();
-			q2_core->delay (1);
-			wait_ms += q2_core->millis () - t0;
-			continue;
-		}
-		n = count < free_words ? count : free_words;
+		spun = 0;
+		n = count < link_free_est ? count : link_free_est;
 		last_sends[last_pos].f1 = (uint16_t)f1;
 		last_sends[last_pos].f2 = (uint16_t)f2;
 		last_sends[last_pos].n = (uint16_t)n;
 		last_pos = (last_pos + 1) & 7u;
-		if (q2_core->link_burst (BZ_FIFO, words, n) != ZM_OK)
+		c0 = lc_now ();
+		if (has_dma)
+		{
+			/* без ожидания хвоста: следующий обмен по LINK (чтение места, чтение SDRAM игрой) дождётся его сам.
+			 * Окно 0x40000 + 2 КБ транзакции — внутри окна очереди 0x40000…0x7FFFC. */
+			int r = q2_core->link_burst_dma (BZ_FIFO, words, n, ZM_LINK_NOWAIT);
+
+			if (r == ZM_NO_MEMORY)
+			{
+				has_dma = 0;                    /* ничего не послано — дальше link_burst */
+				q2_core->log ("q2: LINK DMA: no buffers (internal RAM) — 16-word bursts");
+				continue;
+			}
+			if (r != ZM_OK)
+			{
+				link_ok = 0;
+				return ZM_ERROR;
+			}
+		}
+		else if (q2_core->link_burst (BZ_FIFO, words, n) != ZM_OK)
 		{
 			link_ok = 0;
 			return ZM_ERROR;
 		}
+		lc_burst += lc_now () - c0;
+		lc_nburst++;
 		words += n;
 		count -= n;
 		sent_words += n;
+		link_free_est -= n;
 	}
+	return ZM_OK;
+}
+
+/* Раз в 5 с (q2_app.c, 26.11.2026): слов в ядро за кадр и сколько задача LINK ждала места в очереди ядра
+ * (ядро ещё рисует) — часть «link» в строке «rf parts». Большое ожидание — кадр упирается в само ядро. */
+void bz_link_report (int frames)
+{
+	static uint32_t words0, wait0, reads0, rbytes0;
+	uint32_t        words = sent_words, wait = wait_ms, reads = read_calls, rbytes = read_bytes;
+
+	/* 26.11.2026: и чтения SDRAM ядра (кадры md2, звук) — сколько и сколько байт за кадр */
+	if (frames > 0)
+		q2_core->log ("q2: link, per frame %u words, core queue full %u.%u ms; SDRAM reads %u.%u, %u B",
+		              (unsigned)((words - words0) / frames),
+		              (unsigned)((wait - wait0) / frames), (unsigned)((wait - wait0) * 10u / frames % 10u),
+		              (unsigned)((reads - reads0) / frames), (unsigned)((reads - reads0) * 10u / frames % 10u),
+		              (unsigned)((rbytes - rbytes0) / frames));
+	/* 26.11.2026: время задачи LINK по частям (мс за кадр) и скорость самой передачи (слов в мс внутри link_burst) */
+	if (frames > 0)
+	{
+		const uint32_t k = 240u * (uint32_t)frames;          /* тактов в мкс × кадров */
+		q2_core->log ("q2: link time, ms/frame: burst %u.%u (%u calls, %u words/ms), free %u.%u, wait %u.%u, rd %u.%u",
+		              (unsigned)(lc_burst / k / 1000u), (unsigned)(lc_burst / k % 1000u / 100u),
+		              (unsigned)(lc_nburst / (uint32_t)frames),
+		              (unsigned)(lc_burst / 240000u ? (words - words0) / (lc_burst / 240000u) : 0),
+		              (unsigned)(lc_free / k / 1000u), (unsigned)(lc_free / k % 1000u / 100u),
+		              (unsigned)(lc_wait / k / 1000u), (unsigned)(lc_wait / k % 1000u / 100u),
+		              (unsigned)(lc_rd / k / 1000u), (unsigned)(lc_rd / k % 1000u / 100u));
+	}
+	lc_burst = lc_free = lc_wait = lc_rd = lc_nburst = 0;
+	words0 = words;
+	wait0 = wait;
+	reads0 = reads;
+	rbytes0 = rbytes;
+}
+
+/* Чтение SDRAM с замером (Q2M_LREAD) */
+int bz_link_read (uint32_t addr, void *dst, uint32_t bytes)
+{
+	int r;
+
+	Q2M_BEGIN (Q2M_LREAD);
+	rd_active = 1;                      /* задача LINK новую пачку не начнёт (link_send) */
+	r = link_read_sdram (addr, dst, bytes);
+	rd_active = 0;
+	Q2M_END (Q2M_LREAD);
+	return r;
+}
+
+/* Отправка с замером: время LINK за кадр — в журнал раз в 5 с (Q2M_LINK, q2_app.c), 25.11.2026 */
+int bz_link_send (const uint32_t *words, uint32_t count)
+{
+	int r;
+
+	Q2M_BEGIN (Q2M_LINK);
+	r = link_send (words, count);
+	Q2M_END (Q2M_LINK);
+	return r;
+}
+
+/*
+ * ЗАДАЧА LINK (25.11.2026). Половину буфера кадра (bz_front.c, cb_main_ship) шлёт в ядро своя задача на ядре
+ * ESP 0 — оно почти простаивает (IDLE0 93–96 %), а отправка — ~19 мс на кадр (плата, board_log11). Задача
+ * берёт одну половину за раз; новую bz_link_send_async отдаёт, только когда прошлая ушла, — порядок слов
+ * потока тот же. Вызовы LINK прошивка выполняет под своей блокировкой (tang_link.cpp takeLock), поэтому
+ * чтения игры (кадры md2, звуки, MARK) идут между пачками задачи. Время ожидания игры — Q2M_LWAIT.
+ */
+/*
+ * 26.11.2026: очередь, а не одна половина. Плата (board_log17): игра ждала задачу LINK 4–7 мс за кадр — мир
+ * даёт команды быстрее, чем LINK их уносит, а модели и частицы — медленнее. Теперь в отправке может быть до
+ * tx_depth буферов (bz_link_set_depth; у bz_front.c — по числу запасных буферов кадра), и игра ждёт, только
+ * когда заняты все. Порядок слов тот же: задача шлёт буферы по очереди. Счётчики tq_put (пишет игра) и
+ * tq_done (пишет задача) — каждый своей стороной; в отправке — tq_put − tq_done.
+ */
+#define TQ_MAX 4
+static void          *tx_work, *tx_done;
+static const uint32_t *tq_w[TQ_MAX];
+static uint32_t       tq_n[TQ_MAX];
+static volatile uint32_t tq_put, tq_done;
+static int            tx_depth = 1;
+static volatile int   tx_quit, tx_alive, tx_err;
+static int            tx_state;          /* 0 — не заводилась, 1 — работает, -1 — не вышло (шлём сами) */
+
+/* Сколько буферов может быть в отправке разом (1…TQ_MAX): столько буфер кадра держит в запасе. */
+void bz_link_set_depth (int depth)
+{
+	tx_depth = depth < 1 ? 1 : depth > TQ_MAX ? TQ_MAX : depth;
+}
+
+static void tx_task (void *arg)
+{
+	(void)arg;
+	while (!tx_quit)
+	{
+		uint32_t i;
+
+		if (tq_done == tq_put)
+		{
+			q2_core->signal_wait (tx_work, 100);
+			continue;
+		}
+		i = tq_done % TQ_MAX;
+		if (bz_link_send (tq_w[i], tq_n[i]) != ZM_OK)
+			tx_err = 1;
+		__sync_synchronize ();
+		tq_done++;
+		q2_core->signal_give (tx_done);
+	}
+	tx_alive = 0;
+}
+
+/* Дождаться, что в отправке не больше limit буферов. */
+static void tx_wait_below (uint32_t limit)
+{
+	if (tq_put - tq_done > limit)
+	{
+		Q2M_BEGIN (Q2M_LWAIT);
+		while (tq_put - tq_done > limit)
+			q2_core->signal_wait (tx_done, 20);
+		Q2M_END (Q2M_LWAIT);
+	}
+}
+
+/* Дождаться, что задача LINK отправила всё отданное. ZM_ERROR — отправка не удалась. */
+int bz_link_wait_idle (void)
+{
+	tx_wait_below (0);
+	return tx_err ? ZM_ERROR : ZM_OK;
+}
+
+/* Отдать count слов задаче LINK (буфер не трогать, пока не отданы ещё tx_depth следующих). Задачи нет — шлём
+ * сами. */
+int bz_link_send_async (const uint32_t *words, uint32_t count)
+{
+	if (tx_state == 0)
+	{
+		tx_state = -1;
+		tx_work = q2_core->signal_create ();
+		tx_done = q2_core->signal_create ();
+		tx_quit = tx_err = 0;
+		tq_put = tq_done = 0;
+		tx_alive = 1;
+		if (tx_work && tx_done &&
+		    (q2_core->task_start (tx_task, NULL, 4096, 3, 0) == ZM_OK ||
+		     q2_core->task_start (tx_task, NULL, 4096 | ZM_TASK_STACK_PSRAM, 3, 0) == ZM_OK))
+			tx_state = 1;
+		else
+			tx_alive = 0;
+		q2_core->log ("q2: LINK sender task on core 0: %s", tx_state > 0 ? "running" : "failed, sending inline");
+	}
+	if (tx_state < 0)
+		return bz_link_send (words, count);
+	tx_wait_below ((uint32_t)tx_depth - 1u);
+	if (tx_err)
+		return ZM_ERROR;
+	tq_w[tq_put % TQ_MAX] = words;
+	tq_n[tq_put % TQ_MAX] = count;
+	__sync_synchronize ();
+	tq_put++;
+	q2_core->signal_give (tx_work);
 	return ZM_OK;
 }
 
 void bz_link_close (void)
 {
+	if (tx_state > 0)
+	{
+		uint32_t t0;
+
+		bz_link_wait_idle ();
+		tx_quit = 1;
+		q2_core->signal_give (tx_work);
+		for (t0 = q2_core->millis (); tx_alive && q2_core->millis () - t0 < 500; )
+			q2_core->delay (5);
+		tx_state = 0;
+	}
+	if (has_dma && link_ok && q2_core->link_burst_wait () != ZM_OK)
+		q2_core->log ("q2: LINK DMA: last burst did not finish");
 	if (sent_words)
 		q2_core->log ("q2: LINK %u words, waited %u ms for queue", (unsigned)sent_words, (unsigned)wait_ms);
 	if (read_calls)

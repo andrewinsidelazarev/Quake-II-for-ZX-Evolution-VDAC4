@@ -32,6 +32,7 @@
 #include "r_local.h"
 #include "bz_front.h"
 #include "bomzh.h"
+#include "bz_int.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -55,24 +56,17 @@ int   bz_raw;
 
 #define BZ_MEM      (8u << 20)      /* SDRAM Tang: 8 МБ                                      */
 #define BZ_NEAR     0.6f            /* ближняя плоскость: zi ≤ 1,67 влезает в Q2.30          */
-#define LM_SIZE     0x100000u       /* кольцо lightmap — 1 МБ                                */
 #define TURB_SPEED  20              /* как SPEED и CYCLE в r_scan.c id                       */
 #define TURB_CYCLE  128
 
 /* ---------------------------------------------------------------- раскладка SDRAM модели */
 
-static struct
-{
-	uint32_t fb0, fb1, z;           /* кадры и z                                            */
-	uint32_t colormap, alphamap, pal, turb, solid;
-	uint32_t raw;                   /* кадр кинематики (Draw_StretchRaw)                   */
-	uint32_t lm;                    /* кольцо lightmap                                      */
-	uint32_t tex, tex_end;          /* текстуры, картинки, шкурки                           */
-} mapa;
+static bz_mapa_t mapa;             /* тип — bz_int.h */
 
 /* Хранилище в SDRAM ядра (SPEC 0.4, ниже — «хранилище»): растёт от конца памяти вниз, текстуры — от
  * mapa.tex вверх до store_lo. */
 static uint32_t store_lo;
+static uint32_t store_gen = 1;     /* растёт с каждой раскладкой SDRAM (layout): старые адреса хранилища — мусор */
 
 static void layout (int w, int h)
 {
@@ -93,54 +87,144 @@ static void layout (int w, int h)
 	mapa.tex = mapa.lm + LM_SIZE;
 	mapa.tex_end = BZ_MEM;
 	store_lo = BZ_MEM;              /* хранилище пусто (модели перегружаются вместе с режимом экрана) */
+	store_gen++;                    /* звуки, лежавшие в хранилище, — устарели (BZ_StoreGeneration) */
 }
 
 /* ---------------------------------------------------------------- буферы команд */
-
-/*
- * Буфер команд одного кадра. Кроме слов он помнит последнюю выданную TEX и LMAP: если следующий
- * многоугольник рисуется той же текстурой и тем же lightmap, команда не повторяется — адаптер помнит
- * их сам (состояние в регистрах ПЛИС). Это экономит LINK: модели шлют TEX перед каждым треугольником,
- * а у треугольников одной модели шкурка одна (замер tools/bz_cmdstat.py: −11 КБ на кадр).
- * Состояние сбрасывается, когда буфер начинается заново (новый кадр) и когда к нему дописывается
- * чужой буфер (небо) — после этого адаптер помнит уже не то, что помним мы.
- */
-typedef struct
-{
-	uint32_t *w;
-	uint32_t  n, cap;
-	uint32_t  tex[3], lm[5];     /* последние TEX и LMAP в этом буфере */
-	int       tex_ok, lm_ok;     /* 1 — значения выше действительны   */
-} cbuf_t;
 
 static cbuf_t  cb_main, cb_sky;     /* небо копится отдельно и идёт после непрозрачного мира */
 static uint32_t sky_frame_words;    /* наибольшее число слов неба за кадр — для замера (bz.csv sky_bytes) */
 static cbuf_t *cb = &cb_main;
 static int     need_setup = 1;      /* SETUP ещё не ушёл (ставит BZ_SetMode, снимает BZ_EndFrame) */
 
+/* определены в bz_hot.c (подключён ниже), а зовутся и раньше */
+static inline void put (uint32_t v);
+static texent_t   *tex_get (image_t *img, int mip, int w, int h, int lin);
+static void        tex_page_mark (int p);
+
 #ifdef BZ_ESP
 int bz_link_send (const uint32_t *words, uint32_t count);
-#define CB_ESP_WORDS (1u << 14)   /* ESP: буфер кадра — 64 КБ; полный уходит в ядро сразу            */
+int bz_link_send_async (const uint32_t *words, uint32_t count);   /* bz_link.c: отдать задаче LINK */
+int bz_link_wait_idle (void);                                      /* дождаться, что всё ушло       */
+/* ESP: буфер кадра — две половины по 32 КБ (25.11.2026; было одна на 64 КБ): полная уходит в ядро задачей
+ * LINK на ядре ESP 0 (bz_link.c), а игра тем временем пишет во вторую — отправка (~19 мс на кадр на плате)
+ * идёт параллельно с подготовкой кадра. Порядок слов тот же: задача шлёт половины по одной, по очереди. */
+#define CB_ESP_WORDS (1u << 13)
+/* 26.11.2026: запасных буферов — два, а не один (плата board_log17: игра ждала LINK 4–7 мс за кадр). В отправке
+ * до двух, третий заполняется; +32 КБ PSRAM. Не нашлось второго — работает с одним, как раньше. */
+#define CB_SPARES 2
+void bz_link_set_depth (int depth);   /* bz_link.c: сколько буферов может быть в отправке разом */
+static uint32_t *cb_spare[CB_SPARES]; /* запасные: [0] ушёл раньше всех — его отправка уже кончилась */
+static int       cb_nspare, cb_spare_failed;
+
+/* Отдать накопленное задаче LINK и писать дальше в самый давний запасной буфер: в отправке — не больше
+ * cb_nspare последних (bz_link_send_async ждёт, пока их станет меньше), а он отдан раньше них. */
+static void cb_main_ship (void)
+{
+	uint32_t *t;
+	int       i;
+
+	if (!cb_main.n)
+		return;
+	while (cb_nspare < CB_SPARES && !cb_spare_failed)
+	{
+		if ((cb_spare[cb_nspare] = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
+		{
+			cb_spare_failed = 1;     /* PSRAM нет — больше не пробовать (до BZ_Shutdown) */
+			break;
+		}
+		bz_link_wait_idle ();        /* новый запасной — в общий круг: прежние отправки — до конца */
+		cb_nspare++;
+		bz_link_set_depth (cb_nspare);
+	}
+	if (!cb_nspare)
+	{
+		/* запасного нет (PSRAM) — как раньше: отправить сейчас и ждать */
+		if (bz_link_wait_idle () != 0 || bz_link_send (cb_main.w, cb_main.n) != 0)
+			ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
+		cb_main.n = 0;
+		return;
+	}
+	if (bz_link_send_async (cb_main.w, cb_main.n) != 0)
+		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
+	t = cb_main.w;
+	cb_main.w = cb_spare[0];
+	for (i = 0; i < cb_nspare - 1; i++)
+		cb_spare[i] = cb_spare[i + 1];
+	cb_spare[cb_nspare - 1] = t;
+	cb_main.n = 0;
+}
+
+/* Буферы команд — кадра, неба и запасные (3 × 32 КБ + 4 КБ) — сразу после области уровня, до первой карты
+ * (esp/main/q2_app.c; 26.11.2026). Плата board_log22: смена waste2 → base2 — «malloc: no memory for 65536 bytes»,
+ * свободно 144 КБ кусками не больше 48 КБ: раньше буферы брались при первой отправке, а она — уже посреди
+ * загрузки первой карты (полоса загрузки), и после смены карты они дробили свободное. Не в BZ_Init: та идёт
+ * раньше области уровня, а область — всё свободное минус запас кучи; буферы из неё её урезали бы (board_log23:
+ * 2272 → 2176 КБ, base2 не поместилась). Здесь они — из запаса кучи, как и раньше. */
+void BZ_AllocCmdBuffers (void)
+{
+	if (!cb_main.w)
+	{
+		cb_main.cap = CB_ESP_WORDS;
+		if ((cb_main.w = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
+			ri.Sys_Error (ERR_FATAL, "bz: out of memory");
+	}
+	if (!cb_sky.w)
+	{
+		cb_sky.cap = 1024u;
+		if ((cb_sky.w = malloc (cb_sky.cap * sizeof(uint32_t))) == NULL)
+			ri.Sys_Error (ERR_FATAL, "bz: out of memory");
+	}
+	while (cb_nspare < CB_SPARES && !cb_spare_failed)
+	{
+		if ((cb_spare[cb_nspare] = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
+			cb_spare_failed = 1;
+		else
+			cb_nspare++;
+	}
+	bz_link_set_depth (cb_nspare);
+}
+
+/* Памяти нет (q2_malloc, esp/main/compat.c — после сброса моделей прошлой карты): отдать один запасной буфер
+ * кадра (32 КБ). Сначала — дождаться конца отправок: запасной мог
+ * ещё уходить в ядро. Больше их не брать (до BZ_Shutdown): взятый заново посреди карты снова дробил бы кучу.
+ * 1 — отдан, 0 — отдавать нечего. */
+int BZ_ReleaseSpare (void)
+{
+	if (!cb_nspare)
+		return 0;
+	bz_link_wait_idle ();
+	cb_nspare--;
+	free (cb_spare[cb_nspare]);
+	cb_spare[cb_nspare] = NULL;
+	cb_spare_failed = 1;
+	bz_link_set_depth (cb_nspare);
+	return 1;
+}
 static void emit_setup (void);
-static void put (uint32_t v);
 
 /* ESP: SETUP (таблицы и раскладка SDRAM) — в ядро прямо сейчас, раньше накопленного в буфере кадра (так же
  * его ставит в начало BZ_EndFrame); потом — само накопленное. Буфер кадра остаётся новым и пустым. */
 static void cb_setup_first (void)
 {
-	cbuf_t old = cb_main;
+	cbuf_t old;
 
+	if (bz_link_wait_idle () != 0)       /* задача LINK — ничего в отправке */
+		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
+	old = cb_main;
 	memset (&cb_main, 0, sizeof(cb_main));
 	need_setup = 0;                 /* до emit_setup: его слова уходят частями тем же путём */
 	emit_setup ();
-	if (bz_link_send (cb_main.w, cb_main.n) != 0 || bz_link_send (old.w, old.n) != 0)
+	/* остаток SETUP — тем же путём, что и его начало (половина могла уже уйти задаче LINK), и только когда
+	 * всё ушло — накопленное раньше: две отправки разом перемешали бы поток (25.11.2026) */
+	cb_main_ship ();
+	if (bz_link_wait_idle () != 0 || bz_link_send (old.w, old.n) != 0)
 		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
-	cb_main.n = 0;
 	free (old.w);
 }
 #endif
 
-static void put (uint32_t v)
+static void put_full (uint32_t v)
 {
 #ifdef BZ_ESP
 	/* ESP («диета», шаг 3): буфер кадра не растёт — полный уходит в очередь ядра сразу. Иначе первый кадр
@@ -153,11 +237,7 @@ static void put (uint32_t v)
 		if (need_setup)
 			cb_setup_first ();
 		else
-		{
-			if (bz_link_send (cb->w, cb->n) != 0)
-				ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
-			cb->n = 0;
-		}
+			cb_main_ship ();
 	}
 #endif
 	if (cb->n == cb->cap)
@@ -176,21 +256,9 @@ static void put (uint32_t v)
 	cb->w[cb->n++] = v;
 }
 
-/* Перевод вещественного в 32-битное слово: округление, лишние старшие биты — по модулю 2^32
- * (модель и RTL считают градиенты по модулю, так что это не ошибка, а договор). */
-static uint32_t fx32 (double v)
-{
-	return (uint32_t)(int64_t)floor (v + 0.5);
-}
-
 /* ---------------------------------------------------------------- счётчики переднего края */
 
-static struct
-{
-	uint64_t tex_bytes, lm_bytes, other_bytes;   /* байт загрузок по видам               */
-	uint64_t tex_uploads, lm_builds, tex_flushes;
-	uint64_t faces, faces_clipped_away, tris, tris_culled, parts, polys2d;
-} fs;
+static bz_fstat_t fs;              /* тип — bz_int.h */
 
 #ifndef BZ_ESP
 static void store_trap (uint32_t addr, uint32_t bytes, const uint64_t *counter);   /* ниже, хранилище */
@@ -229,14 +297,6 @@ static int pow2_near (int v)
 	return p;
 }
 
-static int ilog2 (int v)
-{
-	int l = 0;
-	while ((1 << l) < v)
-		l++;
-	return l;
-}
-
 /*
  * Таблица текстур в SDRAM — открытая адресация: ключ ищется с места по свёртке номера и дальше подряд.
  * Ключ — номер картинки (image_t.bz_id: выдаётся один раз и не повторяется), мип-уровень, размер, вид и
@@ -246,19 +306,27 @@ static int ilog2 (int v)
  * Таблица не должна заполниться целиком (поиск не найдёт пустого места): при 7/8 — сброс, как при
  * полной SDRAM (на демо 2017 кадров до этого не доходит — поток команд тот же).
  */
-typedef struct
-{
-	int32_t     id;                /* ключ: номер картинки (0 — место пусто)                */
-	uint32_t    name_hash;         /* ключ: свёртка имени                                    */
-	int16_t     w, h;
-	int16_t     w2, h2;            /* размер в SDRAM (TILED — степени двойки)               */
-	uint8_t     lin, mip;
-	uint32_t    addr;
-} texent_t;
-
-#define TEXHASH 4096
 static texent_t texhash[TEXHASH];
-static uint32_t tex_next, tex_count;
+static uint32_t tex_next, tex_count;    /* tex_next — верх занятого текстурами (отчёт, store_trap)      */
+
+/*
+ * СТРАНИЦЫ ТЕКСТУР (25.11.2026)
+ *   Раньше текстуры клались подряд от mapa.tex, а когда место кончалось (или хранилище — кадры md2 и звуки —
+ *   росло вниз), таблица сбрасывалась целиком: каждую нужную текстуру ESP перечитывала из pak (на плате — с
+ *   карты Evo, запросом к Z80) и грузила снова. Со звуками в хранилище места стало меньше, и сбросы пошли
+ *   посреди игры: на плате tex_get — 40 мс на кадр (медиана), всплески до 237.
+ *   Теперь область текстур — страницы по TEX_PAGE от mapa.tex. Текстура ложится в текущую страницу; не
+ *   влезла — следующая пустая, а пустых нет — освобождается страница, которой дольше всех не пользовались
+ *   (tex_page_frame — номер кадра последнего обращения). Хранилищу, когда оно растёт вниз, отдаются только
+ *   страницы, на которые оно наползает. Порядок команд кадра прежний: если освобождается страница, текстуры
+ *   которой уже нарисованы в этом кадре, их TEX стоят в потоке раньше WRITE новой текстуры — ядро рисует по
+ *   порядку, картинка та же (как и при прежнем сбросе всего).
+ *   Удаление из таблицы (открытая адресация, линейный поиск) — со сдвигом хвоста цепочки назад (Кнут, алг. R).
+ */
+static uint32_t tex_fill[TEX_PAGES];       /* занято байт в странице                                   */
+static uint32_t tex_page_frame[TEX_PAGES]; /* кадр последнего обращения к странице                     */
+static int      tex_cur = -1;              /* текущая страница (-1 — нет)                              */
+static uint32_t tex_frame;                 /* номер кадра (BZ_EndFrame)                                */
 
 static uint32_t name_fnv (const char *s)
 {
@@ -276,22 +344,114 @@ static int image_serial;           /* последний выданный ном
 static int image_id (image_t *img)
 {
 	if (!img->bz_id)
+	{
 		img->bz_id = ++image_serial;
+		/* 26.11.2026: хэш имени — тут же, один раз (раньше tex_get считал его на каждой грани). Имя у места
+		 * картинки не меняется, пока номер выдан: R_FindFreeImage даёт только чистое (memset) место. */
+		img->bz_name_hash = name_fnv (img->name);
+	}
 	return img->bz_id;
-}
-
-/* Есть ли у картинки мип-уровень mip: точки на месте или (отданы ядру) их было столько. */
-static int image_has_mip (const image_t *img, int mip)
-{
-	return img->pixels[mip] != NULL || mip < img->bz_mips;
 }
 
 static void tex_flush (void)
 {
 	memset (texhash, 0, sizeof(texhash));
+	memset (tex_fill, 0, sizeof(tex_fill));
+	tex_cur = -1;
 	tex_next = mapa.tex;
 	tex_count = 0;
 	fs.tex_flushes++;
+}
+
+static uint32_t tex_page_base (int p)
+{
+	return mapa.tex + (uint32_t)p * TEX_PAGE;
+}
+
+/* Страница целиком ниже хранилища — её можно занимать */
+static int tex_page_ok (int p)
+{
+	return p >= 0 && p < TEX_PAGES && tex_page_base (p) + TEX_PAGE <= store_lo;
+}
+
+static uint32_t tex_home (const texent_t *e)
+{
+	return ((uint32_t)e->id * 2654435761u + (unsigned)(e->mip * 2 + e->lin)) & (TEXHASH - 1);
+}
+
+/* Убрать запись i: хвост цепочки сдвигается назад, чтобы поиск не оборвался на дыре */
+static void tex_del (uint32_t i)
+{
+	uint32_t j = i;
+
+	for (;;)
+	{
+		uint32_t k;
+
+		j = (j + 1) & (TEXHASH - 1);
+		if (!texhash[j].id)
+			break;
+		k = tex_home (&texhash[j]);
+		if (i <= j ? (i < k && k <= j) : (i < k || k <= j))
+			continue;               /* её место — между i и j: остаётся */
+		texhash[i] = texhash[j];
+		i = j;
+	}
+	texhash[i].id = 0;
+	tex_count--;
+}
+
+/* Освободить страницу p: её текстуры забыты, при нужде загрузятся снова */
+static void tex_evict (int p)
+{
+	uint32_t lo = tex_page_base (p), hi = lo + TEX_PAGE, i, top = mapa.tex;
+	int      q;
+
+	for (i = 0; i < TEXHASH; )
+		if (texhash[i].id && texhash[i].addr >= lo && texhash[i].addr < hi)
+			tex_del (i);            /* на место i мог сдвинуться следующий — проверить его */
+		else
+			i++;
+	tex_fill[p] = 0;
+	tex_page_frame[p] = 0;
+	if (tex_cur == p)
+		tex_cur = -1;
+	for (q = 0; q < TEX_PAGES; q++)
+		if (tex_fill[q] && tex_page_base (q) + tex_fill[q] > top)
+			top = tex_page_base (q) + tex_fill[q];
+	tex_next = top;
+	fs.tex_flushes++;
+}
+
+/* Страница для новой текстуры: пустая, иначе — давно не нужная (освобождается). -1 — ни одной (не бывает:
+ * хранилище оставляет текстурам STORE_RESERVE — две страницы). */
+static int tex_page_pick (void)
+{
+	int p, best = -1;
+
+	for (p = 0; p < TEX_PAGES; p++)
+		if (tex_page_ok (p) && !tex_fill[p])
+			return p;
+	for (p = 0; p < TEX_PAGES; p++)
+		if (tex_page_ok (p) && (best < 0 || tex_page_frame[p] < tex_page_frame[best]))
+			best = p;
+	if (best >= 0)
+		tex_evict (best);
+	return best;
+}
+
+/* Таблица почти полна: освободить занятую страницу, к которой дольше всех не обращались */
+static void tex_evict_lru (void)
+{
+	int p, best = -1;
+
+	for (p = 0; p < TEX_PAGES; p++)
+		if (tex_fill[p] && (best < 0 || tex_page_frame[p] < tex_page_frame[best]))
+			best = p;
+	if (best >= 0)
+		tex_evict (best);
+	else
+		tex_flush ();
 }
 
 /* для замера на ПК (swimp_bz.c): сколько записей таблицы текстур занято сейчас */
@@ -305,11 +465,13 @@ int BZ_TexCount (void)
  * растягивается до ближайшей степени двойки (у Quake 2 таких 33 стены из 2188).
  * Точки — мип-уровня mip картинки img (w×h — сколько их брать строками ширины w); если их уже отдали
  * (BZ_TEX_RESIDENT), они читаются заново из файла картинки (R_EspReloadPixels). */
-static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
+/* 26.11.2026: поиск в таблице — tex_get (bz_hot.c, горячий модуль); здесь — его продолжение: нет в таблице —
+ * занять место и загрузить (поиск повторяется — он дёшев, а загрузка редка). */
+static texent_t *tex_load_body (image_t *img, int mip, int w, int h, int lin)
 {
 	int       id = image_id (img);
 	uint32_t  hsh = ((uint32_t)id * 2654435761u + (unsigned)(mip * 2 + lin)) & (TEXHASH - 1);
-	uint32_t  nh = name_fnv (img->name);
+	uint32_t  nh = img->bz_name_hash;
 	texent_t *e;
 	byte     *buf, *temp = NULL;
 	const byte *pix;
@@ -321,15 +483,40 @@ static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
 		if (!e->id)
 			break;
 		if (e->id == id && e->mip == mip && e->w == w && e->h == h && e->lin == lin && e->name_hash == nh)
+		{
+			tex_page_mark ((int)((e->addr - mapa.tex) / TEX_PAGE));
 			return e;
+		}
 	}
-	e->w2 = (int16_t)(lin ? w : pow2_near (w));
-	e->h2 = (int16_t)(lin ? h : pow2_near (h));
-	size = ((uint32_t)(e->w2 * e->h2) + 63) & ~63u;
-	if (tex_next + size > store_lo || tex_count >= TEXHASH / 8 * 7)   /* выше store_lo — хранилище */
 	{
-		tex_flush ();
-		return tex_get (img, mip, w, h, lin);
+		int16_t w2 = (int16_t)(lin ? w : pow2_near (w)), h2 = (int16_t)(lin ? h : pow2_near (h));
+		uint32_t a;
+
+		size = ((uint32_t)(w2 * h2) + 63) & ~63u;
+		if (size > TEX_PAGE)
+			ri.Sys_Error (ERR_FATAL, "bz: %s is %u bytes — bigger than a texture page", img->name, (unsigned)size);
+		/* место: таблица почти полна — освободить давно не нужную страницу; текущая страница не годится
+		 * (полна или под хранилищем) — другую. Таблица при этом могла сдвинуться — искать место заново. */
+		if (tex_count >= TEXHASH / 8 * 7)
+		{
+			tex_evict_lru ();
+			return tex_get (img, mip, w, h, lin);
+		}
+		if (!tex_page_ok (tex_cur) || tex_fill[tex_cur] + size > TEX_PAGE)
+		{
+			tex_cur = tex_page_pick ();
+			if (tex_cur < 0)
+				ri.Sys_Error (ERR_FATAL, "bz: no texture page left (store_lo %08x)", (unsigned)store_lo);
+			return tex_get (img, mip, w, h, lin);
+		}
+		a = tex_page_base (tex_cur) + tex_fill[tex_cur];
+		tex_fill[tex_cur] += size;
+		tex_page_mark (tex_cur);
+		if (a + size > tex_next)
+			tex_next = a + size;
+		e->w2 = w2;
+		e->h2 = h2;
+		e->addr = a;
 	}
 	e->id = id;
 	e->mip = (uint8_t)mip;
@@ -337,8 +524,6 @@ static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
 	e->h = (int16_t)h;
 	e->lin = (uint8_t)lin;
 	e->name_hash = nh;
-	e->addr = tex_next;
-	tex_next += size;
 	tex_count++;
 
 	pix = img->pixels[mip];
@@ -366,11 +551,30 @@ static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
 					a = y * e->w2 + x;
 				buf[a] = c;
 			}
-	emit_write (e->addr, buf, (uint32_t)(e->w2 * e->h2), &fs.tex_bytes);
+	{
+		/* загрузка — в основной поток кадра, даже для грани неба (25.11.2026, плата: текстура неба до 64 КБ
+		 * ложилась в буфер неба, тот рос вдвое — «realloc: no memory for 65536 bytes» посреди игры). Небо
+		 * рисуется после мира, загрузка уходит раньше — страница неба до конца кадра не отдаётся (tex_page_mark). */
+		cbuf_t *keep = cb;
+
+		cb = &cb_main;
+		emit_write (e->addr, buf, (uint32_t)(e->w2 * e->h2), &fs.tex_bytes);
+		cb = keep;
+	}
 	free (buf);
 	if (temp)
 		free (temp);
 	fs.tex_uploads++;
+	return e;
+}
+
+/* С меткой Q2M_F_TEX (26.11.2026, BZ_PROF_FINE): загрузка текстуры в SDRAM ядра */
+static texent_t *tex_load (image_t *img, int mip, int w, int h, int lin)
+{
+	texent_t *e;
+	BZ_PROF_BEGIN (Q2M_F_TEX);
+	e = tex_load_body (img, mip, w, h, lin);
+	BZ_PROF_END (Q2M_F_TEX);
 	return e;
 }
 
@@ -430,8 +634,8 @@ void BZ_ImageLoaded (image_t *img)
  *     хранилище остановит прогон.
  */
 #define STORE_ALIGN   32u            /* пачка SDRAM: копия в окно читает пачками по 32 байта */
-#define STORE_RESERVE (512u << 10)   /* текстурам над tex_next оставлять хотя бы столько */
-#define STORE_FREE_N  64
+#define STORE_RESERVE (512u << 10)   /* текстурам оставлять хотя бы столько (две страницы TEX_PAGE) */
+#define STORE_FREE_N  512          /* с 25.11 в хранилище и звуки — сотни кусков на уровень */
 
 #ifdef BZ_ESP
 int bz_link_can_read (void);
@@ -446,6 +650,8 @@ static int      store_nfree;
 static uint32_t store_mark;        /* номер последнего MARK после загрузки в хранилище */
 static uint32_t store_bytes;       /* сколько байт хранилища занято (для отчёта о памяти ESP) */
 static int      store_unsent;      /* ESP: в буфере кадра есть записи хранилища, ядру ещё не отправленные */
+static int      store_dirty;       /* ESP: после последнего MARK были записи в хранилище */
+static int      store_mark_seen;   /* ESP: ядро подтвердило последний MARK, и записей после него не было */
 static int      store_writing;     /* 1 — emit_write пишет само хранилище (BZ_StoreWrite) */
 
 #ifndef BZ_ESP
@@ -483,7 +689,11 @@ uint32_t BZ_StoreBytes (void)
  * когда кадр копит больше неба, чем влезает, и назад не сжимается). */
 uint32_t BZ_CmdBufBytes (void)
 {
+#ifdef BZ_ESP
+	return (cb_main.cap * (1u + (uint32_t)cb_nspare) + cb_sky.cap) * (uint32_t)sizeof(uint32_t);
+#else
 	return (cb_main.cap + cb_sky.cap) * (uint32_t)sizeof(uint32_t);
+#endif
 }
 
 /* ПК: занятые куски хранилища — для сверки теневой копии с памятью модели (store_check). */
@@ -536,19 +746,18 @@ uint32_t BZ_StoreAlloc (uint32_t bytes)
 			store_span_add (a, bytes);     /* сверка — только записанных байт, не хвоста округления */
 			return a;
 		}
-	if (store_lo < size || store_lo - size < tex_next + STORE_RESERVE)
-	{
-		/* Место заняли текстуры. Раньше модель в таком случае оставалась в PSRAM. Но PSRAM у ESP — самая
-		 * тесная память (Unreal NG с PSRAM как на плате, 24.11: на waste2 кадры berserk не легли в SDRAM —
-		 * её заняли ещё и текстуры прошлой карты base2, — пошли в PSRAM, и PSRAM кончилась). Текстуры же
-		 * можно сбросить: таблица текстур пустеет (как при полной SDRAM в tex_get), и каждая догружается,
-		 * когда понадобится. Кадр от этого не меняется, меняется только поток LINK. Сброс — только если
-		 * после него кусок правда влезет. */
-		if (store_lo < size || store_lo - size < mapa.tex + STORE_RESERVE)
-			return 0;                   /* не влезет и над пустыми текстурами — модель останется в PSRAM */
-		tex_flush ();
-	}
+	if (store_lo < size || store_lo - size < mapa.tex + STORE_RESERVE)
+		return 0;                       /* текстурам остаётся хотя бы STORE_RESERVE — иначе модель остаётся в PSRAM */
 	store_lo -= size;
+	/* страницы текстур, на которые наползло хранилище, — освободить (25.11.2026: раньше сбрасывались все) */
+	{
+		int p;
+		for (p = 0; p < TEX_PAGES; p++)
+			if (tex_fill[p] && !tex_page_ok (p))
+				tex_evict (p);
+		if (!tex_page_ok (tex_cur))
+			tex_cur = -1;
+	}
 	store_bytes += size;
 	store_span_add (store_lo, bytes);
 	return store_lo;
@@ -590,7 +799,7 @@ void BZ_StoreFree (uint32_t addr, uint32_t bytes)
 		store_free[store_nfree].size = size;
 		store_nfree++;
 	}
-	/* список полон — кусок потерян до смены режима экрана (не бывает: моделей на уровне меньше 128) */
+	/* список полон — кусок потерян до смены режима экрана (на уровне моделей до ~60 и звуков до ~300 — 512 с запасом) */
 }
 
 /* Записать bytes байт в хранилище: команда WRITE в буфер кадра — по порядку с загрузками текстур. */
@@ -605,6 +814,8 @@ void BZ_StoreWrite (uint32_t addr, const void *data, uint32_t bytes)
 	cb = save;
 #ifdef BZ_ESP
 	store_unsent = 1;
+	store_dirty = 1;
+	store_mark_seen = 0;
 #else
 	if (!store_shadow)
 		store_shadow = calloc (1, BZ_MEM);
@@ -624,6 +835,8 @@ void BZ_StoreMark (void)
 	cb = save;
 #ifdef BZ_ESP
 	store_unsent = 1;
+	store_dirty = 0;
+	store_mark_seen = 0;
 #endif
 }
 
@@ -634,12 +847,11 @@ static void cb_send_now (void)
 {
 	if (need_setup)
 		cb_setup_first ();
-	else if (cb_main.n)
-	{
-		if (bz_link_send (cb_main.w, cb_main.n) != 0)
-			ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
-		cb_main.n = 0;
-	}
+	else
+		cb_main_ship ();
+	/* зовущий будет читать SDRAM ядра — всё отданное должно уйти */
+	if (bz_link_wait_idle () != 0)
+		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
 }
 #endif
 
@@ -647,12 +859,25 @@ static void cb_send_now (void)
 static void store_read (uint32_t addr, void *dst, uint32_t bytes)
 {
 #ifdef BZ_ESP
-	if (store_unsent)               /* записи хранилища ещё в буфере кадра — отправить, иначе MARK не придёт */
+	/* 26.11.2026: ядро уже подтвердило последний MARK, и записей в хранилище с тех пор не было — читать сразу,
+	 * не дожидаясь, пока задача LINK отправит отданную половину буфера кадра (плата, board_log13: игра ждала
+	 * LINK ~11 мс за кадр — в основном здесь, на каждом кадре md2 и куске звука). Чтение SDRAM (RD_ADDR,
+	 * RD_LEN, STATUS, окно) и отправка задачи (FIFO_FREE, FIFO) — разные регистры ядра; каждый вызов LINK
+	 * прошивка делает под своим замком. */
+	if (!store_mark_seen)
 	{
-		cb_send_now ();
-		store_unsent = 0;
+		if (store_unsent)           /* записи хранилища ещё в буфере кадра — отправить, иначе MARK не придёт */
+		{
+			cb_send_now ();
+			store_unsent = 0;
+		}
+		else if (bz_link_wait_idle () != 0)   /* отданные задаче LINK записи (и MARK) — до ядра */
+			ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
+		if (bz_link_wait_mark (store_mark) != 0)
+			ri.Sys_Error (ERR_FATAL, "LINK: SDRAM read of the Q2 core failed");
+		store_mark_seen = !store_dirty;
 	}
-	if (bz_link_wait_mark (store_mark) != 0 || bz_link_read (addr, dst, bytes) != 0)
+	if (bz_link_read (addr, dst, bytes) != 0)
 		ri.Sys_Error (ERR_FATAL, "LINK: SDRAM read of the Q2 core failed");
 #else
 	/* модель исполнит буфер кадра лишь в конце кадра — до того верна теневая копия */
@@ -660,6 +885,18 @@ static void store_read (uint32_t addr, void *dst, uint32_t bytes)
 		ri.Sys_Error (ERR_FATAL, "bz: store read %08x+%u without a shadow", (unsigned)addr, (unsigned)bytes);
 	memcpy (dst, store_shadow + addr, bytes);
 #endif
+}
+
+/* Для звука (snd_mix.c, 25.11.2026): кусок хранилища — адрес кратен 4, как у store_read. */
+void BZ_StoreRead (uint32_t addr, void *dst, uint32_t bytes)
+{
+	store_read (addr, dst, bytes);
+}
+
+/* Номер раскладки SDRAM: звук, положенный в хранилище при другой раскладке, надо перечитать. */
+uint32_t BZ_StoreGeneration (void)
+{
+	return store_gen;
 }
 
 #ifndef BZ_ESP
@@ -747,37 +984,6 @@ const void *BZ_Md2Frame (uint32_t id, int frame, uint32_t addr, int size)
 	return md2_ring + off;
 }
 
-/* Выдать TEX, только если она отличается от последней в этом буфере (см. cbuf_t). */
-static void put_tex_words (uint32_t w0, uint32_t w1, uint32_t w2)
-{
-	if (cb->tex_ok && cb->tex[0] == w0 && cb->tex[1] == w1 && cb->tex[2] == w2)
-		return;
-	put (w0);
-	put (w1);
-	put (w2);
-	cb->tex[0] = w0;
-	cb->tex[1] = w1;
-	cb->tex[2] = w2;
-	cb->tex_ok = 1;
-}
-
-static void put_tex (const texent_t *e)
-{
-	if (e->lin)
-		put_tex_words (((uint32_t)BZ_TEX << 24) | (1u << 16) | (uint32_t)e->w, e->addr,
-		               (uint32_t)e->h | ((uint32_t)e->w << 16));
-	else
-		put_tex_words ((uint32_t)BZ_TEX << 24, e->addr,
-		               (uint32_t)ilog2 (e->w2) | ((uint32_t)ilog2 (e->h2) << 4));
-}
-
-/* Сплошной цвет — «текстура» 1×1 в таблице solid (байт i = i). */
-static void put_solid (int color)
-{
-	put_tex_words (((uint32_t)BZ_TEX << 24) | (1u << 16) | 1u, mapa.solid + (uint32_t)(color & 255),
-	               1u | (1u << 16));
-}
-
 /* Состояние TEX/LMAP буфера больше не известно (новый кадр, дописан чужой буфер). */
 static void cb_forget (cbuf_t *b)
 {
@@ -787,20 +993,6 @@ static void cb_forget (cbuf_t *b)
 
 /* ---------------------------------------------------------------- lightmap */
 
-/* Запись — 36 байт вместо 56 («диета» 23.11, шаг 2): те же значения в узких полях — яркость стиля
- * (white·128, у Quake 2 до ~270), растяжение (до 1449/1024), шаг и строки (до 1024) влезают в 16 бит;
- * место в кольце — 64 бита двумя словами (запись выравнивается по 4, а не по 8 байт). */
-typedef struct
-{
-	msurface_t *surf;
-	uint32_t    pos_lo, pos_hi;    /* место в кольце (сквозной счёт байт)                 */
-	uint32_t    addr;
-	uint16_t    adj[MAXLIGHTMAPS];
-	uint16_t    sw, sh;            /* растяжение текстуры (w2/w и h2/h в 1/1024)           */
-	uint16_t    stride, rows;
-	uint8_t     dlit;
-} lment_t;
-
 /*
  * Таблица lightmap — прямого отображения: у каждой грани одно место (номер грани по модулю размера).
  * Две грани на одном месте вытесняют друг друга: lightmap собирается и пишется в SDRAM заново — тот же,
@@ -808,27 +1000,19 @@ typedef struct
  * массиве граней карты (у моделей-кистей грани в том же массиве), а не адрес в памяти: так поток
  * одинаков на ПК и на ESP. «Диета» 23.11: 16384 записи (917 КБ) → BZ_LMHASH (по умолчанию 4096).
  */
-#ifndef BZ_LMHASH
-#define BZ_LMHASH 4096
-#endif
-#define LMHASH BZ_LMHASH
-static lment_t  lmhash[LMHASH];
+static lment_t  lmhash[LMHASH];      /* LMHASH — bz_int.h */
 static uint64_t lm_total;           /* сколько байт записано в кольцо за всё время          */
 
-static uint32_t lm_slot (const msurface_t *surf)
-{
-	if (r_worldmodel && surf >= r_worldmodel->surfaces &&
-	    surf < r_worldmodel->surfaces + r_worldmodel->numsurfaces)
-		return (uint32_t)(surf - r_worldmodel->surfaces) & (LMHASH - 1);
-	return (uint32_t)(((uintptr_t)surf >> 3) * 2654435761u) & (LMHASH - 1);
-}
+static uint32_t lm_slot (const msurface_t *surf);     /* bz_hot.c */
 
 /* Lightmap грани для адаптера: байт на клетку, L = t >> 6, t — свет программного Quake после
  * R_BuildLightMap (стили, вспышки). Пересобирается, когда меняются стили или на грани есть
  * динамический свет (так же решает кэш поверхностей id). Если текстуру растянули до степени
  * двойки, клетки пересчитываются на ту же сетку (билинейно), чтобы адаптер мог брать клетку
- * сдвигом. */
-static lment_t *lm_get (msurface_t *surf, double fx, double fy)
+ * сдвигом.
+ * 26.11.2026: проверка «запись годна» — lm_get (bz_hot.c, горячий модуль); сюда — только когда нужно собрать
+ * (проверка повторяется — она дешева). */
+static lment_t *lm_build_body (msurface_t *surf, bzr fx, bzr fy)
 {
 	lment_t *e = &lmhash[lm_slot (surf)];
 	int      adj[MAXLIGHTMAPS], i, smax, tmax, sw = (int)(fx * 1024 + 0.5), sh = (int)(fy * 1024 + 0.5);
@@ -906,243 +1090,140 @@ static lment_t *lm_get (msurface_t *surf, double fx, double fy)
 	return e;
 }
 
-/* ---------------------------------------------------------------- многоугольник в команды */
-
-/* Вершина в координатах экрана id: точка (x, y) id — это «целая» координата x, у адаптера центр
- * точки x — это x + ½. Поэтому к координате id прибавляется ½. */
-static uint32_t xy_soft (float u, float v)
+/* С меткой Q2M_F_LM (26.11.2026, BZ_PROF_FINE): сколько стоит сборка lightmap — её зовёт и горячий модуль */
+static lment_t *lm_build (msurface_t *surf, bzr fx, bzr fy)
 {
-	return bz_xy ((int)floor ((u + 0.5) * 16 + 0.5), (int)floor ((v + 0.5) * 16 + 0.5));
+	lment_t *e;
+	BZ_PROF_BEGIN (Q2M_F_LM);
+	e = lm_build_body (surf, fx, fy);
+	BZ_PROF_END (Q2M_F_LM);
+	return e;
 }
 
-/* POLY с n вершинами (больше 16 — веером по 16: выпуклый многоугольник режется по диагоналям из
- * вершины 0, правила края у модели не дают ни щелей, ни двойных точек). g — градиенты
- * {C, A, B} уже в словах; ng — 3 или 4 (свет по вершинам). */
-static void emit_poly (const uint32_t *xy, int n, int mode, const uint32_t g[4][3], int ng)
-{
-	int s = 1;
+/* ---------------------------------------------------------------- горячее: bz_hot.c */
 
-	while (s < n - 1)
-	{
-		int e = s + 14 < n - 1 ? s + 14 : n - 1, k, a, b;
-		int m = e - s + 2;
-		put (((uint32_t)BZ_POLY << 24) | ((uint32_t)mode << 8) | (uint32_t)m);
-		put (xy[0]);
-		for (k = s; k <= e; k++)
-			put (xy[k]);
-		for (a = 0; a < ng; a++)
-			for (b = 0; b < 3; b++)
-				put (g[a][b]);
-		s = e;
-	}
+static bz_ab_t ab;                 /* пачка треугольников модели (тип — bz_int.h; как рисует md2 — ниже) */
+
+/* Горячие функции — в bz_hot.c: тот же исходник собирается и в горячий модуль Q2HOT.ELF (esp/hot/q2hot.c),
+ * который прошивка кладёт во внутреннее ОЗУ. Здесь он подключён как есть — свои копии функций. */
+#include "bz_hot.c"
+
+/* Горячие функции, которые зовутся снаружи: свои копии или (есть модуль) копии модуля во внутреннем ОЗУ */
+#ifdef BZ_ONLY
+#define BZH_LOCAL { sizeof(q2hot_exp_t), Q2HOT_ABI, bz_face, bz_alias_model_tris, bz_particle, hot_final_verts, \
+                    hot_project_final_vert }
+#else
+#define BZH_LOCAL { sizeof(q2hot_exp_t), Q2HOT_ABI, bz_face, bz_alias_model_tris, bz_particle, NULL, NULL }
+#endif
+static const q2hot_exp_t bzh_local = BZH_LOCAL;
+static q2hot_exp_t       bzh = BZH_LOCAL;
+
+#ifdef BZ_ONLY
+/* Перевод вершин модели в экран: у ref_esp этих функций id в r_alias.c нет (p06_ref_esp.py) — они в bz_hot.c */
+void R_AliasTransformFinalVerts (int numpoints, finalvert_t *fv, dtrivertx_t *oldv, dtrivertx_t *newv)
+{
+	bzh.final_verts (numpoints, fv, oldv, newv);
 }
 
-/* Градиенты перспективы в слова: zi (Q2.30) и su = (s/z + K·zi)·f (Q12.20). sdivz — то, что
- * считает D_CalcGradients id, K — постоянная часть s (sadjust/65536 + сдвиг до текстуры), f —
- * растяжение до степени двойки. */
-static void persp_grads (uint32_t g[4][3], double kz[3], double ks, double kt, double fx, double fy,
-                         double sd[3], double td[3])
+void R_AliasProjectAndClipTestFinalVert (finalvert_t *fv)
 {
-	int i;
-	for (i = 0; i < 3; i++)
-	{
-		g[0][i] = fx32 (kz[i] * 1073741824.0);
-		g[1][i] = fx32 ((sd[i] + ks * kz[i]) * fx * 1048576.0);
-		g[2][i] = fx32 ((td[i] + kt * kz[i]) * fy * 1048576.0);
-	}
+	bzh.project_vert (fv);
+}
+#endif
+static q2hot_imp_t       hot_imp;   /* что берёт модуль (BZ_HotTables) */
+static q2hot_exp_t       hot_exp;   /* что он отдал                    */
+
+/* Таблицы для горячего модуля (q2_app.c: module_open_ex «Q2HOT.ELF», arg1 — imp, arg2 — exp; на ПК q2esp.exe с
+ * Q2M_HOT=1 — сам). Адреса данных и функций этого файла и рендера id. */
+void BZ_HotTables (void **imp, void **exp)
+{
+	static const uint32_t sizes[Q2HOT_NSIZES] = Q2HOT_SIZES;
+	q2hot_imp_t *t = &hot_imp;
+
+	memset (t, 0, sizeof(*t));
+	t->size = sizeof(*t);
+	t->abi = Q2HOT_ABI;
+	memcpy (t->sizes, sizes, sizeof(sizes));
+	t->cb = &cb;
+	t->cb_sky = &cb_sky;
+	t->fs = &fs;
+	t->mapa = &mapa;
+	t->ab = &ab;
+	t->texhash = texhash;
+	t->tex_page_frame = tex_page_frame;
+	t->tex_frame = &tex_frame;
+	t->bz_alias_skin = &bz_alias_skin;
+	t->put_full = put_full;
+	t->tex_load = tex_load;
+	t->image_id = image_id;
+	t->lm_build = lm_build;
+	t->lmhash = lmhash;
+	t->lm_total = &lm_total;
+	t->r_worldmodel = &r_worldmodel;
+	t->r_newrefdef = &r_newrefdef;
+	t->r_framecount = &r_framecount;
+	t->BZ_CalcGradients = BZ_CalcGradients;
+	t->currentmodel = &currentmodel;
+	t->r_pcurrentvertbase = &r_pcurrentvertbase;
+	t->view_clipplanes = view_clipplanes;
+	t->modelorg = modelorg;
+	t->vright = vright;
+	t->vup = vup;
+	t->vpn = vpn;
+	t->transformed_modelorg = transformed_modelorg;
+	t->xcenter = &xcenter;
+	t->ycenter = &ycenter;
+	t->xscale = &xscale;
+	t->yscale = &yscale;
+	t->xscaleinv = &xscaleinv;
+	t->yscaleinv = &yscaleinv;
+	t->scale_for_mip = &scale_for_mip;
+	t->r_refdef = &r_refdef;
+	t->d_sdivzorigin = &d_sdivzorigin;
+	t->d_sdivzstepu = &d_sdivzstepu;
+	t->d_sdivzstepv = &d_sdivzstepv;
+	t->d_tdivzorigin = &d_tdivzorigin;
+	t->d_tdivzstepu = &d_tdivzstepu;
+	t->d_tdivzstepv = &d_tdivzstepv;
+	t->sadjust = &sadjust;
+	t->tadjust = &tadjust;
+	t->r_aliasblendcolor = &r_aliasblendcolor;
+	t->r_affinetridesc = &r_affinetridesc;
+	t->currententity = &currententity;
+#ifdef BZ_ONLY
+	t->r_lerp_frontv = r_lerp_frontv;
+	t->r_lerp_backv = r_lerp_backv;
+	t->r_lerp_move = r_lerp_move;
+	t->r_plightvec = r_plightvec;
+	t->r_avertexnormals = r_avertexnormals;
+	t->aliastransform = aliastransform;
+	t->r_ambientlight = &r_ambientlight;
+	t->r_shadelight = &r_shadelight;
+	t->s_ziscale = &s_ziscale;
+#endif
+	t->aliasxscale = &aliasxscale;
+	t->aliasyscale = &aliasyscale;
+	t->aliasxcenter = &aliasxcenter;
+	t->aliasycenter = &aliasycenter;
+	t->R_TextureAnimation = R_TextureAnimation;
+	t->D_MipLevelForScale = D_MipLevelForScale;
+	t->R_AliasClipTriangle = R_AliasClipTriangle;
+	memset (&hot_exp, 0, sizeof(hot_exp));
+	*imp = t;
+	*exp = &hot_exp;
 }
 
-/* Отсечение многоугольника плоскостью: остаётся сторона dot(v, n) − d ≥ 0. */
-static int clip_plane (vec3_t *in, int n, vec3_t *out, const float *normal, float dist)
+/* 1 — звать горячие функции модуля (он отдал таблицу exp), 0 — свои копии. Итог: 1 — модуль взят. */
+int BZ_HotUse (int on)
 {
-	int   i, m = 0;
-	float d0, d1;
-
-	for (i = 0; i < n; i++)
+	if (on && hot_exp.size == sizeof(hot_exp) && hot_exp.abi == Q2HOT_ABI && hot_exp.face && hot_exp.alias_tris &&
+	    hot_exp.particle && hot_exp.final_verts && hot_exp.project_vert)
 	{
-		float *p = in[i], *q = in[(i + 1) % n];
-		d0 = DotProduct (p, normal) - dist;
-		d1 = DotProduct (q, normal) - dist;
-		if (d0 >= 0)
-		{
-			VectorCopy (p, out[m]);	/* макрос id: m++ внутри подставился бы трижды */
-			m++;
-		}
-		if ((d0 >= 0) != (d1 >= 0))
-		{
-			float f = d0 / (d0 - d1);
-			out[m][0] = p[0] + f * (q[0] - p[0]);
-			out[m][1] = p[1] + f * (q[1] - p[1]);
-			out[m][2] = p[2] + f * (q[2] - p[2]);
-			m++;
-		}
+		bzh = hot_exp;
+		return 1;
 	}
-	return m;
-}
-
-#define MAXFV 80
-
-/* Грань мира, модели-кисти или неба: alpha 0, 33 или 66. */
-static void bz_face (msurface_t *fa, int clipflags, int alpha)
-{
-	static vec3_t va[MAXFV], vb[MAXFV];
-	vec3_t   *in = va, *out = vb, *t;
-	float     su[MAXFV][2];
-	uint32_t  xy[MAXFV], g[4][3];
-	int       n, i, mip, mode, light;
-	float     nearzi = 0;
-	image_t  *image;
-	medge_t  *pedges = currentmodel->edges;
-	texent_t *te;
-	vec3_t    p_normal;
-	double    distinv, kz[3], sd[3], td[3], ks, kt, fx, fy;
-	int       offs = 0, offt = 0;
-
-	fs.faces++;
-	n = fa->numedges;
-	if (n < 3 || n > MAXFV - 8)
-		return;
-	for (i = 0; i < n; i++)
-	{
-		int li = currentmodel->surfedges[fa->firstedge + i];
-		float *pos = li > 0 ? r_pcurrentvertbase[pedges[li].v[0]].position
-		                    : r_pcurrentvertbase[pedges[-li].v[1]].position;
-		VectorCopy (pos, in[i]);
-	}
-	/* 1. плоскости пирамиды вида, как R_RenderFace (бит i — плоскость i) */
-	for (i = 0; i < 4 && n >= 3; i++)
-		if (clipflags & (1 << i))
-		{
-			n = clip_plane (in, n, out, view_clipplanes[i].normal, view_clipplanes[i].dist);
-			t = in; in = out; out = t;
-		}
-	if (n < 3)
-	{
-		fs.faces_clipped_away++;
-		return;
-	}
-	/* 2. в пространство вида и ближняя плоскость */
-	for (i = 0; i < n; i++)
-	{
-		vec3_t local;
-		VectorSubtract (in[i], modelorg, local);
-		TransformVector (local, out[i]);
-	}
-	t = in; in = out; out = t;
-	{
-		static const float zn[3] = { 0, 0, 1 };
-		n = clip_plane (in, n, out, zn, BZ_NEAR);
-		t = in; in = out; out = t;
-	}
-	if (n < 3)
-	{
-		fs.faces_clipped_away++;
-		return;
-	}
-	/* 3. проекция и зажим к краям окна, как R_EmitEdge */
-	for (i = 0; i < n; i++)
-	{
-		float zi = 1.0f / in[i][2], u, v;
-		u = xcenter + xscale * zi * in[i][0];
-		v = ycenter - yscale * zi * in[i][1];
-		if (u < r_refdef.fvrectx_adj) u = r_refdef.fvrectx_adj;
-		if (u > r_refdef.fvrectright_adj) u = r_refdef.fvrectright_adj;
-		if (v < r_refdef.fvrecty_adj) v = r_refdef.fvrecty_adj;
-		if (v > r_refdef.fvrectbottom_adj) v = r_refdef.fvrectbottom_adj;
-		if (zi > nearzi)
-			nearzi = zi;
-		su[i][0] = u;
-		su[i][1] = v;
-		xy[i] = xy_soft (u, v);
-	}
-
-	/* 4. вид грани: как выбирают D_DrawSurfaces и R_BuildPolygonFromSurface id */
-	if (fa->flags & SURF_DRAWSKYBOX)
-	{
-		mip = 0;
-		image = fa->texinfo->image;
-		mode = BZ_M_PERSP | BZ_L_NONE | BZ_M_SKY;
-	}
-	else if (alpha)
-	{
-		mip = 0;
-		mode = BZ_M_PERSP | BZ_M_ZTEST | (alpha == 66 ? BZ_T_66 : BZ_T_33);
-		if (fa->texinfo->flags & SURF_WARP)
-		{
-			/* прозрачная вода id берёт координаты текстуры, а не кэша поверхности */
-			image = fa->texinfo->image;
-			mode |= BZ_L_NONE | BZ_M_WARP;
-			offs = fa->texturemins[0] & 127;
-			offt = fa->texturemins[1] & 127;
-		}
-		else
-		{
-			image = R_TextureAnimation (fa->texinfo);
-			mode |= BZ_L_LMAP;
-		}
-	}
-	else if (fa->flags & SURF_DRAWTURB)
-	{
-		mip = 0;
-		image = fa->texinfo->image;
-		mode = BZ_M_PERSP | BZ_L_NONE | BZ_M_ZTEST | BZ_M_ZWRITE | BZ_M_ZGT;
-		if (fa->texinfo->flags & SURF_WARP)
-			mode |= BZ_M_WARP;
-	}
-	else
-	{
-		mip = D_MipLevelForScale (nearzi * scale_for_mip * fa->texinfo->mipadjust);
-		image = R_TextureAnimation (fa->texinfo);
-		mode = BZ_M_PERSP | BZ_L_LMAP | BZ_M_ZTEST | BZ_M_ZWRITE | BZ_M_ZGT;
-	}
-	if (!image || !image_has_mip (image, mip))
-		return;
-	light = mode & BZ_M_LIGHT;
-
-	/* 5. градиенты id: 1/z — из плоскости (как R_RenderFace), s/z и t/z — D_CalcGradients */
-	TransformVector (fa->plane->normal, p_normal);
-	distinv = 1.0 / (fa->plane->dist - DotProduct (modelorg, fa->plane->normal));
-	kz[1] = p_normal[0] * xscaleinv * distinv;
-	kz[2] = -p_normal[1] * yscaleinv * distinv;
-	kz[0] = p_normal[2] * distinv - xcenter * kz[1] - ycenter * kz[2];
-	TransformVector (modelorg, transformed_modelorg);
-	BZ_CalcGradients (fa, mip);
-	sd[0] = d_sdivzorigin; sd[1] = d_sdivzstepu; sd[2] = d_sdivzstepv;
-	td[0] = d_tdivzorigin; td[1] = d_tdivzstepu; td[2] = d_tdivzstepv;
-
-	te = tex_get (image, mip, image->width >> mip, image->height >> mip, 0);
-	fx = (double)te->w2 / te->w;
-	fy = (double)te->h2 / te->h;
-	if (light == BZ_L_LMAP)
-	{
-		/* s кэша id отсчитан от texturemins; сдвиг до текстуры — по модулю её ширины */
-		offs = ((fa->texturemins[0] >> mip) % te->w + te->w) % te->w;
-		offt = ((fa->texturemins[1] >> mip) % te->h + te->h) % te->h;
-	}
-	ks = sadjust / 65536.0 + offs;
-	kt = tadjust / 65536.0 + offt;
-	persp_grads (g, kz, ks, kt, fx, fy, sd, td);
-
-	if (light == BZ_L_LMAP)
-	{
-		lment_t *lm = lm_get (fa, fx, fy);
-		uint32_t w[5], k;
-		w[0] = (uint32_t)BZ_LMAP << 24;
-		w[1] = lm->addr;
-		w[2] = (uint32_t)lm->stride | ((uint32_t)lm->rows << 16) | ((uint32_t)(4 - mip) << 24);
-		w[3] = fx32 (offs * fx * 65536.0);
-		w[4] = fx32 (offt * fy * 65536.0);
-		/* LMAP — тоже только при смене (грань из нескольких кусков веера, повтор после неба) */
-		if (!cb->lm_ok || memcmp (cb->lm, w, sizeof(w)))
-		{
-			for (k = 0; k < 5; k++)
-				put (w[k]);
-			memcpy (cb->lm, w, sizeof(w));
-			cb->lm_ok = 1;
-		}
-	}
-	put_tex (te);
-	emit_poly (xy, n, mode, (const uint32_t (*)[3])g, 3);
+	bzh = bzh_local;
+	return 0;
 }
 
 /* ---------------------------------------------------------------- врезки 3D */
@@ -1190,14 +1271,16 @@ void BZ_EndWorld (void)
 
 void BZ_RenderFace (msurface_t *fa, int clipflags)
 {
+	BZ_PROF_BEGIN (Q2M_F_FACE);
 	if (fa->flags & SURF_DRAWSKYBOX)
 	{
 		cb = &cb_sky;
-		bz_face (fa, clipflags, 0);
+		bzh.face (fa, clipflags, 0);
 		cb = &cb_main;
 	}
 	else
-		bz_face (fa, clipflags, 0);
+		bzh.face (fa, clipflags, 0);
+	BZ_PROF_END (Q2M_F_FACE);
 }
 
 void BZ_AlphaSurfaces (void)
@@ -1208,7 +1291,7 @@ void BZ_AlphaSurfaces (void)
 	r_pcurrentvertbase = r_worldmodel->vertexes;
 	VectorCopy (r_origin, modelorg);
 	for (s = r_alpha_surfaces; s; s = s->nextalphasurface)
-		bz_face (s, 15, (s->texinfo->flags & SURF_TRANS66) ? 66 : 33);
+		bzh.face (s, 15, (s->texinfo->flags & SURF_TRANS66) ? 66 : 33);
 	r_alpha_surfaces = NULL;
 }
 
@@ -1233,79 +1316,6 @@ void BZ_AlphaSurfaces (void)
  * новые вершины не из pfinalverts — он идёт прежним POLY. Чтобы порядок рисования остался как у id
  * (от него зависят равные z), перед таким треугольником пачка отправляется.
  */
-#define AB_MAX   512                    /* мест в буферах вершин и st адаптера (SPEC.md)            */
-#define AB_TRIS  4096                   /* треугольников в пачке (у md2 их не больше 4096)          */
-#define STH_N    1024                   /* хэш st: в 2 раза больше AB_MAX — короткие цепочки поиска */
-
-static struct
-{
-	finalvert_t *base;                  /* pfinalverts модели, что сейчас рисуется (NULL — нет)     */
-	int          nbase;
-	int          kind;                  /* вид закраски пачки (как у BZ_AliasTriangle)             */
-	short        vmap[MAXALIASVERTS];   /* номер вершины id → её номер в пачке + 1 (0 — не взята)   */
-	int          vlist[AB_MAX], nv;     /* номера вершин id в порядке пачки                         */
-	uint32_t     stv[AB_MAX];  int nst; /* точки шкурки пачки: {s, t} по 16 бит                     */
-	uint32_t     sth_key[STH_N];        /* хэш «точка шкурки → номер в пачке»                       */
-	short        sth_idx[STH_N];
-	int          sth_gen[STH_N], gen;   /* поколение: запись действительна, если gen совпадает      */
-	uint32_t     tw[2 * AB_TRIS];       /* слова TRIS                                               */
-	int          ntri;
-} ab;
-
-static int alias_mode (int kind)
-{
-	switch (kind)
-	{
-	case 1:  return BZ_L_VERT | BZ_M_ZTEST | BZ_T_33;
-	case 2:  return BZ_L_VERT | BZ_M_ZTEST | BZ_M_ZWRITE | BZ_T_66;
-	case 3:  return BZ_L_NONE | BZ_M_ZTEST | BZ_T_33;
-	case 4:  return BZ_L_NONE | BZ_M_ZTEST | BZ_T_66;
-	default: return BZ_L_VERT | BZ_M_ZTEST | BZ_M_ZWRITE;
-	}
-}
-
-/* Текстура для треугольников модели: шкурка или (оболочка «quad damage» и т. п.) сплошной цвет. */
-static void alias_tex (int kind)
-{
-	if (kind >= 3)
-		put_solid (r_aliasblendcolor);
-	else
-		put_tex (tex_get (bz_alias_skin, 0, r_affinetridesc.skinwidth, r_affinetridesc.skinheight, 1));
-}
-
-/* Отправить накопленную пачку: TEX, VBUF, STBUF, TRIS (по 255 треугольников в команде). */
-static void ab_flush (void)
-{
-	int k, s;
-
-	if (ab.ntri)
-	{
-		alias_tex (ab.kind);
-		put (((uint32_t)BZ_VBUF << 24) | (uint32_t)ab.nv);
-		for (k = 0; k < ab.nv; k++)
-		{
-			const finalvert_t *fv = ab.base + ab.vlist[k];
-			put (bz_xy (fv->u, fv->v));
-			put ((uint32_t)(fv->zi >> 1));        /* 1/z·2^31 у id → Q2.30 */
-			put ((uint32_t)fv->l);
-		}
-		put (((uint32_t)BZ_STBUF << 24) | (uint32_t)ab.nst);
-		for (k = 0; k < ab.nst; k++)
-			put (ab.stv[k]);
-		for (s = 0; s < ab.ntri; s += 255)
-		{
-			const int m = ab.ntri - s < 255 ? ab.ntri - s : 255;
-			put (((uint32_t)BZ_TRIS << 24) | ((uint32_t)alias_mode (ab.kind) << 8) | (uint32_t)m);
-			for (k = 0; k < 2 * m; k++)
-				put (ab.tw[2 * s + k]);
-		}
-	}
-	for (k = 0; k < ab.nv; k++)
-		ab.vmap[ab.vlist[k]] = 0;
-	ab.nv = ab.nst = ab.ntri = 0;
-	ab.gen++;
-}
-
 /* Номер точки шкурки {s, t} в пачке: найти в хэше или добавить. */
 static int ab_st (uint32_t key)
 {
@@ -1325,6 +1335,12 @@ static int ab_st (uint32_t key)
 	}
 }
 
+/* Все треугольники модели (врезка p04 в R_AliasPreparePoints): bz_alias_model_tris — bz_hot.c */
+int BZ_AliasModelTris (void *pmdl, void *pfinalverts, int reverse, int kind)
+{
+	return bzh.alias_tris (pmdl, pfinalverts, reverse, kind);
+}
+
 /* Начало модели: врезка в R_AliasPreparePoints после перевода вершин в экран. */
 void BZ_AliasModelBegin (void *pfinalverts, int num)
 {
@@ -1340,14 +1356,15 @@ void BZ_AliasModelEnd (void)
 	ab.base = NULL;
 }
 
+
 /* Треугольник модели (md2) после отсечения id: вершины — целые точки экрана id, s, t — 16.16
  * шкурки, l — свет id (строка colormap = l >> 8), zi — 1/z·2^31 (у оружия ·3, RF_DEPTHHACK).
  * kind: 0 — непрозрачно, 1/2 — 33/66 %, 3/4 — оболочка сплошным цветом 33/66 %. */
-void BZ_AliasTriangle (int kind)
+static void bz_alias_triangle (int kind)
 {
 	finalvert_t *p[3] = { aliastriangleparms.a, aliastriangleparms.b, aliastriangleparms.c };
 	uint32_t xy[3], g[4][3];
-	double   f[4][3], d, du1, dv1, du2, dv2;
+	bzr      f[4][3], d, du1, dv1, du2, dv2;
 	int      i, dv0_ab, dv1_ab, dv0_ac, dv1_ac;
 
 	/* отбор как в R_DrawTriangle id: вырожденные и обращённые спиной — мимо */
@@ -1398,10 +1415,10 @@ void BZ_AliasTriangle (int kind)
 	for (i = 0; i < 3; i++)
 	{
 		xy[i] = bz_xy (p[i]->u * 16 + 8, p[i]->v * 16 + 8);
-		f[0][i] = p[i]->zi * 0.5;          /* Q31 id → Q2.30 */
+		f[0][i] = p[i]->zi * BZR(0.5);     /* Q31 id → Q2.30 */
 		f[1][i] = p[i]->s;
 		f[2][i] = p[i]->t;
-		f[3][i] = p[i]->l * 65536.0;
+		f[3][i] = p[i]->l * BZR(65536.0);
 	}
 	/* плоскость через три вершины: значение в точке (x, y) id = C + A·x + B·y */
 	du1 = p[1]->u - p[0]->u; dv1 = p[1]->v - p[0]->v;
@@ -1409,8 +1426,8 @@ void BZ_AliasTriangle (int kind)
 	d = du1 * dv2 - du2 * dv1;
 	for (i = 0; i < 4; i++)
 	{
-		double a = ((f[i][1] - f[i][0]) * dv2 - (f[i][2] - f[i][0]) * dv1) / d;
-		double b = (du1 * (f[i][2] - f[i][0]) - du2 * (f[i][1] - f[i][0])) / d;
+		bzr a = ((f[i][1] - f[i][0]) * dv2 - (f[i][2] - f[i][0]) * dv1) / d;
+		bzr b = (du1 * (f[i][2] - f[i][0]) - du2 * (f[i][1] - f[i][0])) / d;
 		g[i][0] = fx32 (f[i][0] - a * p[0]->u - b * p[0]->v);
 		g[i][1] = fx32 (a);
 		g[i][2] = fx32 (b);
@@ -1419,24 +1436,17 @@ void BZ_AliasTriangle (int kind)
 	emit_poly (xy, 3, alias_mode (kind), (const uint32_t (*)[3])g, kind >= 3 ? 3 : 4);
 }
 
-/* Частица: u, v, размер и уровень прозрачности посчитал R_DrawParticle id. */
+/* Частица (врезка p04 в R_DrawParticle): bz_particle — bz_hot.c */
 void BZ_Particle (int u, int v, float zi, int pix, int color, int level)
 {
-	int trans = level == 0 ? 1 : level == 1 ? 2 : 0;        /* PARTICLE_33, _66, _OPAQUE */
-
-	if (pix > 15)
-		pix = 15;
-	put (((uint32_t)BZ_POINT << 24) | ((uint32_t)trans << 12) | ((uint32_t)pix << 8) | (uint32_t)(color & 255));
-	put (bz_xy (u, v));
-	put (fx32 (zi * 1073741824.0));
-	fs.parts++;
+	bzh.particle (u, v, zi, pix, color, level);
 }
 
 /* Спрайт или луч: r_polydesc уже отсечён и спроецирован R_ClipAndDrawPoly id. */
 void BZ_DrawPoly (int iswater, int blendcolor)
 {
 	uint32_t xy[MAXFV], g[4][3];
-	double   kz[3], sd[3], td[3];
+	bzr      kz[3], sd[3], td[3];
 	int      i, n = r_polydesc.nump, mode;
 
 	if (n < 3 || n > MAXFV)
@@ -1447,7 +1457,7 @@ void BZ_DrawPoly (int iswater, int blendcolor)
 	kz[0] = d_ziorigin; kz[1] = d_zistepu; kz[2] = d_zistepv;
 	sd[0] = d_sdivzorigin; sd[1] = d_sdivzstepu; sd[2] = d_sdivzstepv;
 	td[0] = d_tdivzorigin; td[1] = d_tdivzstepu; td[2] = d_tdivzstepv;
-	persp_grads (g, kz, sadjust / 65536.0, tadjust / 65536.0, 1, 1, sd, td);
+	persp_grads (g, kz, sadjust / BZR(65536.0), tadjust / BZR(65536.0), 1, 1, sd, td);
 
 	if (!bz_poly_textured)
 	{
@@ -1627,6 +1637,20 @@ void BZ_Init (void)
 	bz_trace_cv = ri.Cvar_Get ("bz_trace", "0", 0);
 	q2m_out_cv = ri.Cvar_Get ("q2m_out", "", 0);
 	q2m_frame_cv = ri.Cvar_Get ("q2m_frame", "0", 0);
+#if defined BZ_ONLY && !defined BZ_ESP
+	/* q2esp.exe с Q2M_HOT=1 (26.11.2026): горячие функции — через таблицы, как у модуля Q2HOT.ELF на ESP
+	 * (esp/hot/q2hot.c собран сюда же с переназначением имён) — кадры должны совпасть с обычной сборкой */
+	if (getenv ("Q2M_HOT") && atoi (getenv ("Q2M_HOT")))
+	{
+		void *imp, *exp;
+		int   r;
+
+		BZ_HotTables (&imp, &exp);
+		r = q2hot_entry ((const q2hot_imp_t *)imp, (q2hot_exp_t *)exp);
+		/* в stderr, не в консоль игры: строка консоли попала бы в кадр заставки, и кадры разошлись бы */
+		fprintf (stderr, "bz: hot module (PC test): entry %d, in use %d\n", r, r == 0 && BZ_HotUse (1));
+	}
+#endif
 #ifndef BZ_ESP
 	bz_md2trace_cv = ri.Cvar_Get ("bz_md2trace", "0", 0);
 	if (!model)
@@ -1643,6 +1667,13 @@ void BZ_SetMode (int width, int height)
 	memset (lmhash, 0, sizeof(lmhash));
 	lm_total = 0;
 	need_setup = 1;
+	/* хранилище пусто (layout): его списки — тоже (25.11.2026: раньше свободные куски прошлой раскладки
+	 * оставались в списке и могли выдаться поверх текстур новой) */
+	store_nfree = 0;
+	store_bytes = 0;
+#ifndef BZ_ESP
+	store_nspan = 0;
+#endif
 	/* кольцо кадров md2 — сейчас, пока куча PSRAM сплошная (раньше — при первом кадре, после загрузки
 	 * карты: на плате 24.11 256 КБ одним куском тогда уже не нашлось) */
 	if (!md2_ring && BZ_StoreAvailable ())
@@ -1671,6 +1702,19 @@ void BZ_Shutdown (void)
 	model = NULL;
 	free (soft_copy);
 	soft_copy = NULL;
+#ifdef BZ_ESP
+	bz_link_wait_idle ();             /* буферы могла ещё отправлять задача LINK */
+	{
+		int i;
+		for (i = 0; i < cb_nspare; i++)
+		{
+			free (cb_spare[i]);
+			cb_spare[i] = NULL;
+		}
+		cb_nspare = cb_spare_failed = 0;
+		bz_link_set_depth (1);
+	}
+#endif
 	free (cb_main.w);
 	free (cb_sky.w);
 	memset (&cb_main, 0, sizeof(cb_main));
@@ -1801,6 +1845,8 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 	uint32_t          err;
 	int               frame, i, diff = 0, vis = 0, a;
 
+	tex_frame++;                    /* страницы текстур: давность обращения — в кадрах */
+
 #ifdef BZ_ESP
 	if (!BZ_Enabled ())             /* ESP: кадра id нет (vid.buffer пуст) — команды всё равно уходят */
 		return;
@@ -1831,9 +1877,7 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 #ifdef BZ_ESP
 	/* ESP: весь кадр — в очередь ядра Tang; ядро рисует его само (сравнивать не с чем) */
 	(void)st; (void)mf; (void)err; (void)frame; (void)i; (void)diff; (void)vis; (void)palette_rgba;
-	if (bz_link_send (cb_main.w, cb_main.n) != 0)
-		Com_Error (ERR_FATAL, "LINK to the Q2 core failed");
-	cb_main.n = 0;
+	cb_main_ship ();                /* кадр уходит задачей LINK — следующий готовится параллельно */
 	cb_forget (&cb_main);
 	cb_forget (&cb_sky);
 	memset (&fs, 0, sizeof(fs));
@@ -1964,4 +2008,12 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 	bz_stats_reset (model);
 	memset (&fs, 0, sizeof(fs));
 #endif
+}
+
+/* Треугольник модели с замером (Q2M_A_TRI, 25.11.2026: где время моделей на плате) */
+void BZ_AliasTriangle (int kind)
+{
+	BZ_PROF_BEGIN (Q2M_A_TRI);
+	bz_alias_triangle (kind);
+	BZ_PROF_END (Q2M_A_TRI);
 }

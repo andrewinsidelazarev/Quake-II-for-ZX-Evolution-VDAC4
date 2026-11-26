@@ -112,6 +112,7 @@ void VID_Init (void)
 	ri.Vid_GetModeInfo = VID_GetModeInfo;
 	ri.Vid_MenuInit = VID_MenuInit;
 	ri.Vid_NewWindow = VID_NewWindow;
+	ri.LoadingProgress = SCR_LoadingWorldProgress;	// полоса загрузки (cl_scrn.c)
 
 	re = GetRefAPI (ri);
 	if (re.api_version != API_VERSION)

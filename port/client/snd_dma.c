@@ -152,7 +152,8 @@ void S_Init (void)
 		{
 			known_sfx = Z_Malloc (MAX_SFX * sizeof(sfx_t));
 			s_playsounds = Z_Malloc (MAX_PLAYSOUNDS * sizeof(playsound_t));
-			s_rawsamples = Z_Malloc (MAX_RAW_SAMPLES * sizeof(portable_samplepair_t));
+			// s_rawsamples (64 КБ) — только при первом S_RawSamples: поток звука кинематик, а их у порта
+			// нет (видео не в pak); смешивание читает его, лишь пока s_rawend >= paintedtime (25.11.2026)
 		}
 
 		S_InitScaletable ();
@@ -198,8 +199,7 @@ void S_Shutdown(void)
 	{
 		if (!sfx->name[0])
 			continue;
-		if (sfx->cache)
-			Z_Free (sfx->cache);
+		S_FreeSfxCache (sfx);		// порт VDAC4: и место в SDRAM
 		memset (sfx, 0, sizeof(*sfx));
 	}
 
@@ -340,6 +340,8 @@ S_EndRegistration
 
 =====================
 */
+static int	s_load_total, s_load_done;	// порт VDAC4: полоса загрузки (S_EndRegistration)
+
 void S_EndRegistration (void)
 {
 	int		i;
@@ -353,8 +355,8 @@ void S_EndRegistration (void)
 			continue;
 		if (sfx->registration_sequence != s_registration_sequence)
 		{	// don't need this sound
-			if (sfx->cache)	// it is possible to have a leftover
-				Z_Free (sfx->cache);	// from a server that didn't finish loading
+			// it is possible to have a leftover from a server that didn't finish loading
+			S_FreeSfxCache (sfx);	// порт VDAC4: и место в SDRAM
 			memset (sfx, 0, sizeof(*sfx));
 		}
 		else
@@ -362,18 +364,36 @@ void S_EndRegistration (void)
 			if (sfx->cache)
 			{
 				size = sfx->cache->length*sfx->cache->width;
+#ifdef Q2_SND_STORE
+				if (sfx->cache->store)	// порт VDAC4: отсчёты в SDRAM — здесь только заголовок
+					size = sizeof(sfxcache_t);
+#endif
 				Com_PageInMemory ((byte *)sfx->cache, size);
 			}
 		}
 
 	}
 
+	// порт VDAC4 (26.11.2026): полоса загрузки — по звукам, которых ещё нет (уже загруженные проходят сразу)
+	for (i=0, sfx=known_sfx, size=0 ; i < num_sfx ; i++,sfx++)
+		if (sfx->name[0] && !sfx->cache)
+			size++;
+	s_load_total = size;
+	s_load_done = 0;
+	SCR_LoadingProgress (LS_SOUNDS, 0, s_load_total);
+
 	// load everything in
 	for (i=0, sfx=known_sfx ; i < num_sfx ; i++,sfx++)
 	{
 		if (!sfx->name[0])
 			continue;
-		S_LoadSound (sfx);
+		if (!sfx->cache)
+		{
+			S_LoadSound (sfx);
+			SCR_LoadingProgress (LS_SOUNDS, ++s_load_done, s_load_total);
+		}
+		else
+			S_LoadSound (sfx);
 	}
 
 	s_registering = false;
@@ -930,6 +950,8 @@ void S_RawSamples (int samples, int rate, int width, int channels, byte *data)
 
 	if (!sound_started)
 		return;
+	if (!s_rawsamples)		// порт VDAC4: см. S_Init
+		s_rawsamples = Z_Malloc (MAX_RAW_SAMPLES * sizeof(portable_samplepair_t));
 
 	if (s_rawend < paintedtime)
 		s_rawend = paintedtime;
@@ -1158,6 +1180,20 @@ void S_Update_(void)
 	if (endtime - soundtime > samps)
 		endtime = soundtime + samps;
 
+#ifdef Q2_SND_STORE
+	// порт VDAC4 (26.11.2026): смешивать реже и крупнее. Отсчёты звуков лежат в SDRAM ядра, и на каждый
+	// звучащий канал каждый кусок смешивания — чтение по LINK со своей постоянной ценой (адрес, ожидание
+	// ядра, окно, замок LINK): плата board_log17 — lread ~5,4 мс за кадр. Каждый кадр смешивалось ~460
+	// отсчётов (11025 Гц / 24 кадра); теперь — когда до цели не меньше S_PAINT_BATCH (кусками до 2048,
+	// PAINTBUFFER_SIZE snd_mix.c), чтений в ~3,5 раза меньше. Запас перед выводом — от s_mixahead −
+	// S_PAINT_BATCH (0,3 с − 139 мс = 161 мс) до s_mixahead: выше хвоста DMA (snddma_esp.c, ~80 мс).
+	#define S_PAINT_BATCH	1536
+	if ((int)(endtime - paintedtime) < S_PAINT_BATCH && paintedtime > soundtime)
+	{
+		SNDDMA_Submit ();
+		return;
+	}
+#endif
 	S_PaintChannels (endtime);
 
 	SNDDMA_Submit ();

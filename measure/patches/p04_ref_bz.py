@@ -75,14 +75,16 @@ PATCHES = {
          '\tint dv1_ab, dv0_ac;\n\tint dv0_ab, dv1_ac;\n',
          'void R_PolysetDrawSpansConstant8_33 (spanpackage_t *pspanpackage);\n'
          'void R_PolysetDrawSpansConstant8_66 (spanpackage_t *pspanpackage);\n\n'
+         '// ref_bz: вид закраски — по выбранной id функции отрезков\n'
+         'int BZ_AliasKind (void)\n{\n'
+         '\treturn d_pdrawspans == R_PolysetDrawSpans8_33 ? 1 :\n'
+         '\t       d_pdrawspans == R_PolysetDrawSpans8_66 ? 2 :\n'
+         '\t       d_pdrawspans == R_PolysetDrawSpansConstant8_33 ? 3 :\n'
+         '\t       d_pdrawspans == R_PolysetDrawSpansConstant8_66 ? 4 : 0;\n}\n\n'
          'void R_DrawTriangle( void )\n{\n\tspanpackage_t spans[DPS_MAXSPANS];\n\n'
          '\tint dv1_ab, dv0_ac;\n\tint dv0_ab, dv1_ac;\n\n'
          '\tif (bz_pass)\n\t{\n'
-         '\t\t// ref_bz: вид закраски — по выбранной id функции отрезков\n'
-         '\t\tBZ_AliasTriangle (d_pdrawspans == R_PolysetDrawSpans8_33 ? 1 :\n'
-         '\t\t                  d_pdrawspans == R_PolysetDrawSpans8_66 ? 2 :\n'
-         '\t\t                  d_pdrawspans == R_PolysetDrawSpansConstant8_33 ? 3 :\n'
-         '\t\t                  d_pdrawspans == R_PolysetDrawSpansConstant8_66 ? 4 : 0);\n'
+         '\t\tBZ_AliasTriangle (BZ_AliasKind ());\n'
          '\t\treturn;\n\t}\n'),
     ],
     'r_alias.c': [
@@ -90,7 +92,16 @@ PATCHES = {
         ('aliasbatchedtransformdata.this_verts );\n',
          'aliasbatchedtransformdata.this_verts );\n\n'
          '\tif (bz_pass)\t\t// ref_bz: вершины модели уже в экране — начать пачку треугольников\n'
-         '\t\tBZ_AliasModelBegin (pfinalverts, s_pmdl->num_xyz);\n'),
+         '\t{\n'
+         '\t\tBZ_AliasModelBegin (pfinalverts, s_pmdl->num_xyz);\n'
+         '\t\t// 26.11.2026: треугольники — сразу в пачку по номерам md2 (обрезанные краем — R_AliasClipTriangle id)\n'
+         '\t\tif (BZ_AliasModelTris (s_pmdl, pfinalverts,\n'
+         '\t\t                       (currententity->flags & RF_WEAPONMODEL) && r_lefthand->value == 1.0F, BZ_AliasKind ()))\n'
+         '\t\t{\n'
+         '\t\t\tBZ_AliasModelEnd ();\n'
+         '\t\t\treturn;\n'
+         '\t\t}\n'
+         '\t}\n'),
         ('\tr_affinetridesc.pskin = pskindesc->pixels[0];\n',
          '\tr_affinetridesc.pskin = pskindesc->pixels[0];\n'
          '\tbz_alias_skin = pskindesc;\t\t// ref_bz: шкурка для таблицы текстур ядра (по картинке, не по точкам)\n'),
@@ -157,6 +168,7 @@ PATCHES = {
          '\tint             registration_sequence;  // 0 = free\n\tbyte\t\t*pixels[4];\t\t\t\t// mip levels\n'
          '\tint\t\tbz_id;\t\t\t\t\t// ref_bz: номер картинки для таблицы текстур ядра (0 — ещё не выдан)\n'
          '\tint\t\tbz_mips;\t\t\t\t// ref_bz: сколько мип-уровней было, когда точки отдали (BZ_TEX_RESIDENT)\n'
+         '\tunsigned\tbz_name_hash;\t\t\t// ref_bz: хэш имени — считается вместе с bz_id (26.11.2026)\n'
          '} image_t;\n'),
     ],
     'r_image.c': [
