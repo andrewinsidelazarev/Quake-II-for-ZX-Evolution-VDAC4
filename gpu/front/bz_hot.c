@@ -63,7 +63,7 @@ static void tex_page_mark (int p)
 }
 
 /* Найти текстуру в таблице SDRAM ядра (её место и вид); нет — загрузить (tex_load в bz_front.c). */
-static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
+static texent_t *tex_get_shared (image_t *img, int mip, int w, int h, int lin)
 {
 	int       id = img->bz_id ? img->bz_id : image_id (img);
 	uint32_t  hsh = ((uint32_t)id * 2654435761u + (unsigned)(mip * 2 + lin)) & (TEXHASH - 1);
@@ -82,6 +82,15 @@ static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
 		}
 	}
 	return tex_load (img, mip, w, h, lin);
+}
+
+/* 28.11.2026: модели на ядре 0 (сторона 1) общую таблицу не трогают — её в это время меняет мир; их текстуры игра
+ * загрузила заранее (BZ_EntBegin) и положила в таблицу кадра (ent_tex). */
+static texent_t *tex_get (image_t *img, int mip, int w, int h, int lin)
+{
+	if (bz_ectx ())
+		return ent_tex (img, mip, w, h, lin);
+	return tex_get_shared (img, mip, w, h, lin);
 }
 
 /* Выдать TEX, только если она отличается от последней в этом буфере (см. cbuf_t). */
@@ -231,9 +240,10 @@ static uint32_t lm_slot (const msurface_t *surf)
 static lment_t *lm_get (msurface_t *surf, bzr fx, bzr fy)
 {
 	lment_t *e = &lmhash[lm_slot (surf)];
-	int      adj[MAXLIGHTMAPS], i, sw = (int)(fx * 1024 + 0.5), sh = (int)(fy * 1024 + 0.5);
+	int      adj[MAXLIGHTMAPS], i, sw = (int)(fx * 1024 + 0.5f), sh = (int)(fy * 1024 + 0.5f);
 	int      dlit = surf->dlightframe == r_framecount;
 	int      fits = 1;              /* все яркости влезают в 16 бит записи — иначе не кэшировать */
+	/* 28.11.2026: «+ 0.5f» вместо «+ 0.5» (double у ESP — программный): fx·1024 < 2^22 — сумма во float точна */
 
 	for (i = 0; i < MAXLIGHTMAPS; i++)
 	{
@@ -257,6 +267,40 @@ static void hot_transform (const float *in, float *out)
 	out[2] = DotProduct (in, vpn);
 }
 
+/* 28.11.2026 («разгрузить тяжёлые кадры»): вид — оси, точка взгляда, центр и масштаб экрана — в локальной копии на
+ * грань. В горячем модуле это чтения через таблицу импорта, и с -fno-strict-aliasing компилятор перечитывал их после
+ * каждой записи вершины. Выражения те же: (w − modelorg) и DotProduct с vright, vup, vpn в том же порядке. */
+typedef struct
+{
+	float o[3], r[3], u[3], f[3];
+	float xc, xs, yc, ys;
+} hot_view_t;
+
+static inline void hot_view_load (hot_view_t *hv)
+{
+	int k;
+
+	for (k = 0; k < 3; k++)
+	{
+		hv->o[k] = modelorg[k];
+		hv->r[k] = vright[k];
+		hv->u[k] = vup[k];
+		hv->f[k] = vpn[k];
+	}
+	hv->xc = xcenter; hv->xs = xscale;
+	hv->yc = ycenter; hv->ys = yscale;
+}
+
+/* точка мира → пространство вида: VectorSubtract (w, modelorg) и hot_transform */
+static inline void hot_view_point (const hot_view_t *hv, const float *w, float *out)
+{
+	const float l0 = w[0] - hv->o[0], l1 = w[1] - hv->o[1], l2 = w[2] - hv->o[2];
+
+	out[0] = l0 * hv->r[0] + l1 * hv->r[1] + l2 * hv->r[2];
+	out[1] = l0 * hv->u[0] + l1 * hv->u[1] + l2 * hv->u[2];
+	out[2] = l0 * hv->f[0] + l1 * hv->f[1] + l2 * hv->f[2];
+}
+
 /*
  * Грань, задетая краями окна (clipflags ≠ 0), — без отсечения плоскостями пирамиды вида (27.11.2026, «нужно хотя
  * бы 30 fps»; профиль Unreal NG: clip_plane — 6 % команд кадра). Вершины переводятся в пространство вида, режутся
@@ -271,8 +315,8 @@ static void hot_transform (const float *in, float *out)
  * 1 — xy[], *nout и *nearzi готовы; 0 — грань вести прежним путём.
  */
 #define FACE_GUARD 2000.0f
-#if 0	/* выключен — см. bz_face */
-static int face_guard (msurface_t *fa, vec3_t *wv, int n, int needs_mip, uint32_t *xy, int *nout, float *nearzi)
+static int face_guard (const hot_view_t *hv, msurface_t *fa, vec3_t *wv, int n, int needs_mip, uint32_t *xy, int *nout,
+                       float *nearzi)
 {
 	static vec3_t ga[MAXFV], gb[MAXFV];
 	static const float zn[3] = { 0, 0, 1 };
@@ -283,12 +327,11 @@ static int face_guard (msurface_t *fa, vec3_t *wv, int n, int needs_mip, uint32_
 	const float x0 = r_refdef.fvrectx_adj, x1 = r_refdef.fvrectright_adj;
 	const float y0 = r_refdef.fvrecty_adj, y1 = r_refdef.fvrectbottom_adj;
 	float   area = 0;
+	const float gl = (float)bz_guard_left;
 
 	for (i = 0; i < n; i++)
 	{
-		vec3_t local;
-		VectorSubtract (wv[i], modelorg, local);
-		hot_transform (local, in[i]);
+		hot_view_point (hv, wv[i], in[i]);
 		if (!(in[i][2] - BZ_NEAR >= 0))
 			all_front = 0;
 	}
@@ -302,9 +345,12 @@ static int face_guard (msurface_t *fa, vec3_t *wv, int n, int needs_mip, uint32_
 	for (i = 0; i < n; i++)
 	{
 		float zi = 1.0f / in[i][2], u, v;
-		u = xcenter + xscale * zi * in[i][0];
-		v = ycenter - yscale * zi * in[i][1];
-		if (!(u > -FACE_GUARD && u < FACE_GUARD && v > -FACE_GUARD && v < FACE_GUARD))
+		u = hv->xc + hv->xs * zi * in[i][0];
+		v = hv->yc - hv->ys * zi * in[i][1];
+		/* x ≥ bz_guard_left (bz_front.c): ядро 0.03 левый край отрезка зажимало к ножницам беззнаковым сравнением
+		 * (bz_raster.sv: «l < scx0[15:0]» — выборка части беззнаковая) и отрезки левее окна теряло (стенд tb_raster,
+		 * трасса demo1 с этим путём: кадр 124, l = −51; на плате — пропавшие стены, board_log30). Исправлено в 0.04. */
+		if (!(u >= gl && u < FACE_GUARD && v > -FACE_GUARD && v < FACE_GUARD))
 			return 0;
 		su[i][0] = u;
 		su[i][1] = v;
@@ -372,7 +418,68 @@ static int face_guard (msurface_t *fa, vec3_t *wv, int n, int needs_mip, uint32_
 	*nearzi = lo;
 	return 1;
 }
-#endif
+
+/* (int)(v + 0.5) id, где сумма — в double (v — float): то же число без double. |v| < 2^23 — сумма во float точна;
+ * больше — v целое: v ≥ 0 — само v, v < 0 — округление к нулю даёт v + 1. */
+static inline int hot_round_half (float v)
+{
+	if (v < 8388608.0f && v > -8388608.0f)
+		return (int)(v + 0.5f);
+	return (int)v + (v < 0);
+}
+
+/*
+ * D_CalcGradients id (r_edge.c) — для грани и уровня mip: s/z, t/z по экрану и сдвиги s, t (28.11.2026). Своя копия
+ * в горячем модуле: у id она в коде основного (PSRAM) и считает в double — «1.0 / (1 << mip)» и два «+ 0.5» с
+ * переводом в целое на каждую грань; у ESP32-S3 double программный. Числа те же: 1/2^mip — степень двойки,
+ * «+ 0.5» — hot_round_half. Поворот осей — hot_transform (то же выражение, что TransformVector id).
+ */
+static void hot_calc_gradients (msurface_t *pface, int mip, bzr sd[3], bzr td[3], int *psadj, int *ptadj)
+{
+	const mtexinfo_t *ti = pface->texinfo;
+	const float       mipscale = 1.0f / (float)(1 << mip);
+	vec3_t            p_temp1, p_saxis, p_taxis;
+	float             t, sstepu, tstepu, sstepv, tstepv;
+	int               sadj, tadj;
+
+	hot_transform (ti->vecs[0], p_saxis);
+	hot_transform (ti->vecs[1], p_taxis);
+
+	t = xscaleinv * mipscale;
+	sstepu = p_saxis[0] * t;
+	tstepu = p_taxis[0] * t;
+
+	t = yscaleinv * mipscale;
+	sstepv = -p_saxis[1] * t;
+	tstepv = -p_taxis[1] * t;
+
+	sd[0] = p_saxis[2] * mipscale - xcenter * sstepu - ycenter * sstepv;
+	td[0] = p_taxis[2] * mipscale - xcenter * tstepu - ycenter * tstepv;
+	sd[1] = sstepu; sd[2] = sstepv;
+	td[1] = tstepu; td[2] = tstepv;
+
+	/* VectorScale id — функция основного (горячему модулю недоступна): то же выражение */
+	p_temp1[0] = transformed_modelorg[0] * mipscale;
+	p_temp1[1] = transformed_modelorg[1] * mipscale;
+	p_temp1[2] = transformed_modelorg[2] * mipscale;
+
+	t = 0x10000 * mipscale;
+	sadj = (hot_round_half (DotProduct (p_temp1, p_saxis) * 0x10000) - ((pface->texturemins[0] << 16) >> mip))
+	       + ti->vecs[0][3] * t;
+	tadj = (hot_round_half (DotProduct (p_temp1, p_taxis) * 0x10000) - ((pface->texturemins[1] << 16) >> mip))
+	       + ti->vecs[1][3] * t;
+
+	// PGM - changing flow speed for non-warping textures.
+	if (ti->flags & SURF_FLOWING)
+	{
+		if (ti->flags & SURF_WARP)
+			sadj += 0x10000 * (-128 * ( (r_newrefdef.time * 0.25) - (int)(r_newrefdef.time * 0.25) ));
+		else
+			sadj += 0x10000 * (-128 * ( (r_newrefdef.time * 0.77) - (int)(r_newrefdef.time * 0.77) ));
+	}
+	*psadj = sadj;
+	*ptadj = tadj;
+}
 
 /* Грань мира, модели-кисти или неба: alpha 0, 33 или 66. */
 static void bz_face (msurface_t *fa, int clipflags, int alpha)
@@ -388,12 +495,14 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 	texent_t *te;
 	vec3_t    p_normal;
 	bzr       distinv, kz[3], sd[3], td[3], ks, kt, fx, fy;
-	int       offs = 0, offt = 0;
+	int       offs = 0, offt = 0, sadj, tadj;
+	hot_view_t hv;
 
 	fs.faces++;
 	n = fa->numedges;
 	if (n < 3 || n > MAXFV - 8)
 		return;
+	hot_view_load (&hv);
 	for (i = 0; i < n; i++)
 	{
 		int li = currentmodel->surfedges[fa->firstedge + i];
@@ -401,14 +510,11 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 		                    : r_pcurrentvertbase[pedges[-li].v[1]].position;
 		VectorCopy (pos, in[i]);
 	}
-	/* 27.11.2026: путь без отсечения пирамидой (face_guard) ВЫКЛЮЧЕН — на плате (board_log30, ядро 0.03) грани у
-	 * краёв окна рисовались с ошибками (пропавшие стены, чёрные куски), хотя модель ядра на C рисует их верно:
-	 * растеризатор ПЛИС не выдерживает такие многоугольники. Включать — только после проверки RTL на стенде. */
-#if 0
-	if (clipflags && face_guard (fa, in, n, !(fa->flags & (SURF_DRAWSKYBOX | SURF_DRAWTURB)) && !alpha,
+	/* 27.11.2026: задетая краями окна — сначала без отсечения пирамидой вида (face_guard, выше). Первая версия
+	 * (board_log30) пускала вершины и левее окна — ядро 0.03 теряло такие отрезки (пропавшие стены); теперь x ≥ 0. */
+	if (clipflags && face_guard (&hv, fa, in, n, !(fa->flags & (SURF_DRAWSKYBOX | SURF_DRAWTURB)) && !alpha,
 	                             xy, &n, &nearzi))
 		goto projected;
-#endif
 	/* 1. плоскости пирамиды вида, как R_RenderFace (бит i — плоскость i) */
 	for (i = 0; i < 4 && n >= 3; i++)
 		if (clipflags & (1 << i))
@@ -427,9 +533,7 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 
 		for (i = 0; i < n; i++)
 		{
-			vec3_t local;
-			VectorSubtract (in[i], modelorg, local);
-			hot_transform (local, out[i]);
+			hot_view_point (&hv, in[i], out[i]);
 			if (!(out[i][2] - BZ_NEAR >= 0))
 				all_front = 0;
 		}
@@ -449,22 +553,27 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 		return;
 	}
 	/* 3. проекция и зажим к краям окна, как R_EmitEdge */
+	{
+	const float ex0 = r_refdef.fvrectx_adj, ex1 = r_refdef.fvrectright_adj;
+	const float ey0 = r_refdef.fvrecty_adj, ey1 = r_refdef.fvrectbottom_adj;
 	for (i = 0; i < n; i++)
 	{
 		float zi = 1.0f / in[i][2], u, v;
-		u = xcenter + xscale * zi * in[i][0];
-		v = ycenter - yscale * zi * in[i][1];
-		if (u < r_refdef.fvrectx_adj) u = r_refdef.fvrectx_adj;
-		if (u > r_refdef.fvrectright_adj) u = r_refdef.fvrectright_adj;
-		if (v < r_refdef.fvrecty_adj) v = r_refdef.fvrecty_adj;
-		if (v > r_refdef.fvrectbottom_adj) v = r_refdef.fvrectbottom_adj;
+		u = hv.xc + hv.xs * zi * in[i][0];
+		v = hv.yc - hv.ys * zi * in[i][1];
+		if (u < ex0) u = ex0;
+		if (u > ex1) u = ex1;
+		if (v < ey0) v = ey0;
+		if (v > ey1) v = ey1;
 		if (zi > nearzi)
 			nearzi = zi;
 		su[i][0] = u;
 		su[i][1] = v;
 		xy[i] = xy_soft (u, v);
 	}
+	}
 
+projected:
 	/* 4. вид грани: как выбирают D_DrawSurfaces и R_BuildPolygonFromSurface id */
 	if (fa->flags & SURF_DRAWSKYBOX)
 	{
@@ -515,9 +624,7 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 	kz[2] = -p_normal[1] * yscaleinv * distinv;
 	kz[0] = p_normal[2] * distinv - xcenter * kz[1] - ycenter * kz[2];
 	hot_transform (modelorg, transformed_modelorg);
-	BZ_CalcGradients (fa, mip);
-	sd[0] = d_sdivzorigin; sd[1] = d_sdivzstepu; sd[2] = d_sdivzstepv;
-	td[0] = d_tdivzorigin; td[1] = d_tdivzstepu; td[2] = d_tdivzstepv;
+	hot_calc_gradients (fa, mip, sd, td, &sadj, &tadj);
 
 	BZ_PROF_BEGIN (Q2M_F_TEX);
 	te = tex_get (image, mip, image->width >> mip, image->height >> mip, 0);
@@ -530,8 +637,8 @@ static void bz_face (msurface_t *fa, int clipflags, int alpha)
 		offs = ((fa->texturemins[0] >> mip) % te->w + te->w) % te->w;
 		offt = ((fa->texturemins[1] >> mip) % te->h + te->h) % te->h;
 	}
-	ks = sadjust / BZR(65536.0) + offs;
-	kt = tadjust / BZR(65536.0) + offt;
+	ks = sadj / BZR(65536.0) + offs;
+	kt = tadj / BZR(65536.0) + offt;
 	persp_grads (g, kz, ks, kt, fx, fy, sd, td);
 
 	if (light == BZ_L_LMAP)
@@ -648,6 +755,7 @@ reset:
 		ab.smap[ab.slist[k]] = 0;
 	ab.nv = ab.nst = ab.ntri = ab.nsl = 0;
 	ab.gen++;
+	ent_tick ();                         /* сторона 1: задача LINK — своё (28.11.2026) */
 }
 
 /*
@@ -664,7 +772,8 @@ reset:
 #define AB_GUARD 2000
 static inline int ab_in_guard (const finalvert_t *v)
 {
-	return v->u > -AB_GUARD && v->u < AB_GUARD && v->v > -AB_GUARD && v->v < AB_GUARD;
+	/* u ≥ bz_guard_left: левее окна ядро 0.03 отрезок теряло (см. face_guard) */
+	return v->u >= bz_guard_left && v->u < AB_GUARD && v->v > -AB_GUARD && v->v < AB_GUARD;
 }
 
 static int bz_alias_model_tris (void *pmdl, void *pfinalverts, int reverse, int kind)
@@ -698,6 +807,8 @@ static int bz_alias_model_tris (void *pmdl, void *pfinalverts, int reverse, int 
 		const int    f0 = p0->flags, f1 = p1->flags, f2 = p2->flags;
 		int          v0, v1, v2, q0, q1, q2;
 
+		if (!(t & 255))
+			ent_tick ();                         /* сторона 1: задача LINK — своё (28.11.2026) */
 		if (f0 & f1 & f2)
 			continue;                           /* весь за одним краем */
 		/* 26.11.2026 («нужно хотя бы 30 fps»; плата: треугольники моделей ~6,5 мс кадра): задетый только краем
@@ -796,7 +907,7 @@ static void hot_project_final_vert( finalvert_t *fv )
 	x = fv->xyz[0];
 	y = fv->xyz[1];
 	z = fv->xyz[2];
-	zi = 1.0 / z;
+	zi = 1.0f / z;          /* 28.11.2026: во float — то же частное, что у id в double (см. hot_final_verts) */
 
 	fv->zi = zi * s_ziscale;
 
@@ -813,43 +924,76 @@ static void hot_project_final_vert( finalvert_t *fv )
 		fv->flags |= ALIAS_BOTTOM_CLIP;
 }
 
+/*
+ * 28.11.2026 («разгрузить тяжёлые кадры», плата board_log38/39: модели — 9–14 мс тяжёлого кадра; профиль Unreal NG:
+ * этот цикл и проекция — ~10 % команд кадра). Тот же расчёт, что у id, но:
+ *  - 1/z — во float: у id «1.0 / z» делилось в double, а у ESP32-S3 double — программный (__divdf3). Частное
+ *    двух float, посчитанное в double и округлённое к float, равно частному во float: 53 ≥ 2·24 + 2, двойное
+ *    округление безвредно (деление, сложение, умножение — правильно округлённые операции);
+ *  - всё, что от вершины не зависит (сдвиг и веса кадров, поворот, свет, масштаб, края окна), — в локальных до
+ *    цикла: в горячем модуле это чтения через таблицу импорта, и с -fno-strict-aliasing компилятор перечитывал их
+ *    после каждой записи в fv. Выражения и их порядок — те же;
+ *  - три прохода: поворот и свет → 1/z → проекция. Деление у ESP32-S3 — вызов __divsf3 (ПЗУ), а вызов у Xtensa не
+ *    сохраняет регистры FPU: внутри общего цикла компилятор выгружал вокруг него в стек все живые float (поворот,
+ *    свет, масштаб). Во втором проходе живого — только указатель и счётчик. Частное пока лежит в fv->zi битами
+ *    float, третий проход кладёт туда же целое id.
+ */
 static void hot_final_verts( int numpoints, finalvert_t *fv, dtrivertx_t *oldv, dtrivertx_t *newv )
 {
+	const float mv0 = r_lerp_move[0], mv1 = r_lerp_move[1], mv2 = r_lerp_move[2];
+	const float bk0 = r_lerp_backv[0], bk1 = r_lerp_backv[1], bk2 = r_lerp_backv[2];
+	const float fr0 = r_lerp_frontv[0], fr1 = r_lerp_frontv[1], fr2 = r_lerp_frontv[2];
+	const float m00 = aliastransform[0][0], m01 = aliastransform[0][1], m02 = aliastransform[0][2], m03 = aliastransform[0][3];
+	const float m10 = aliastransform[1][0], m11 = aliastransform[1][1], m12 = aliastransform[1][2], m13 = aliastransform[1][3];
+	const float m20 = aliastransform[2][0], m21 = aliastransform[2][1], m22 = aliastransform[2][2], m23 = aliastransform[2][3];
+	const float lv0 = r_plightvec[0], lv1 = r_plightvec[1], lv2 = r_plightvec[2];
+	const int   ambient = r_ambientlight;
+	const float shade = r_shadelight;
+	// PMM - added double damage shell
+	const int   shell = ( e_currententity->flags & ( RF_SHELL_RED | RF_SHELL_GREEN | RF_SHELL_BLUE | RF_SHELL_DOUBLE | RF_SHELL_HALF_DAM) ) != 0;
+	const float xs = aliasxscale, ys = aliasyscale, xc = aliasxcenter, yc = aliasycenter, zs = s_ziscale;
+	const int   ed_l = r_refdef.aliasvrect.x, ed_t = r_refdef.aliasvrect.y;
+	const int   ed_r = r_refdef.aliasvrectright, ed_b = r_refdef.aliasvrectbottom;
+	float     (*normals)[3] = r_avertexnormals;
+	finalvert_t *const fv0 = fv;
 	int i;
 
+	/* 1. поворот, свет, признак ближней плоскости */
 	for ( i = 0; i < numpoints; i++, fv++, oldv++, newv++ )
 	{
 		int		temp;
 		float	lightcos, *plightnormal;
-		vec3_t  lerped_vert;
+		float   x, y, z;
 
-		lerped_vert[0] = r_lerp_move[0] + oldv->v[0]*r_lerp_backv[0] + newv->v[0]*r_lerp_frontv[0];
-		lerped_vert[1] = r_lerp_move[1] + oldv->v[1]*r_lerp_backv[1] + newv->v[1]*r_lerp_frontv[1];
-		lerped_vert[2] = r_lerp_move[2] + oldv->v[2]*r_lerp_backv[2] + newv->v[2]*r_lerp_frontv[2];
+		x = mv0 + oldv->v[0]*bk0 + newv->v[0]*fr0;
+		y = mv1 + oldv->v[1]*bk1 + newv->v[1]*fr1;
+		z = mv2 + oldv->v[2]*bk2 + newv->v[2]*fr2;
 
-		plightnormal = r_avertexnormals[newv->lightnormalindex];
+		plightnormal = normals[newv->lightnormalindex];
 
-		// PMM - added double damage shell
-		if ( currententity->flags & ( RF_SHELL_RED | RF_SHELL_GREEN | RF_SHELL_BLUE | RF_SHELL_DOUBLE | RF_SHELL_HALF_DAM) )
+		if ( shell )
 		{
-			lerped_vert[0] += plightnormal[0] * POWERSUIT_SCALE;
-			lerped_vert[1] += plightnormal[1] * POWERSUIT_SCALE;
-			lerped_vert[2] += plightnormal[2] * POWERSUIT_SCALE;
+			x += plightnormal[0] * POWERSUIT_SCALE;
+			y += plightnormal[1] * POWERSUIT_SCALE;
+			z += plightnormal[2] * POWERSUIT_SCALE;
 		}
 
-		fv->xyz[0] = DotProduct(lerped_vert, aliastransform[0]) + aliastransform[0][3];
-		fv->xyz[1] = DotProduct(lerped_vert, aliastransform[1]) + aliastransform[1][3];
-		fv->xyz[2] = DotProduct(lerped_vert, aliastransform[2]) + aliastransform[2][3];
+		{
+			const float ez = x*m20 + y*m21 + z*m22 + m23;
 
-		fv->flags = 0;
+			fv->xyz[0] = x*m00 + y*m01 + z*m02 + m03;
+			fv->xyz[1] = x*m10 + y*m11 + z*m12 + m13;
+			fv->xyz[2] = ez;
+			fv->flags = ez < ALIAS_Z_CLIP_PLANE ? ALIAS_Z_CLIP : 0;
+		}
 
 		// lighting
-		lightcos = DotProduct (plightnormal, r_plightvec);
-		temp = r_ambientlight;
+		lightcos = plightnormal[0]*lv0 + plightnormal[1]*lv1 + plightnormal[2]*lv2;
+		temp = ambient;
 
 		if (lightcos < 0)
 		{
-			temp += (int)(r_shadelight * lightcos);
+			temp += (int)(shade * lightcos);
 
 			// clamp; because we limited the minimum ambient and shading light, we
 			// don't have to clamp low light, just bright
@@ -858,15 +1002,43 @@ static void hot_final_verts( int numpoints, finalvert_t *fv, dtrivertx_t *oldv, 
 		}
 
 		fv->l = temp;
-
-		if ( fv->xyz[2] < ALIAS_Z_CLIP_PLANE )
-		{
-			fv->flags |= ALIAS_Z_CLIP;
-		}
-		else
-		{
-			hot_project_final_vert( fv );
-		}
 	}
+
+	/* 2. 1/z (R_AliasProjectAndClipTestFinalVert id) — биты float в fv->zi */
+	for ( i = 0, fv = fv0; i < numpoints; i++, fv++ )
+		if ( !fv->flags )
+		{
+			union { float f; int i; } c;     /* memcpy в горячем модуле — вызов, не встраивается */
+			c.f = 1.0f / fv->xyz[2];
+			fv->zi = c.i;
+		}
+
+	/* 3. проекция и края окна */
+	for ( i = 0, fv = fv0; i < numpoints; i++, fv++ )
+		if ( !fv->flags )
+		{
+			union { float f; int i; } c;
+			float zi;
+			int   u, v, flags = 0;
+
+			c.i = fv->zi;
+			zi = c.f;
+			fv->zi = zi * zs;
+
+			u = (fv->xyz[0] * xs * zi) + xc;
+			v = (fv->xyz[1] * ys * zi) + yc;
+			fv->u = u;
+			fv->v = v;
+
+			if (u < ed_l)
+				flags |= ALIAS_LEFT_CLIP;
+			if (v < ed_t)
+				flags |= ALIAS_TOP_CLIP;
+			if (u > ed_r)
+				flags |= ALIAS_RIGHT_CLIP;
+			if (v > ed_b)
+				flags |= ALIAS_BOTTOM_CLIP;
+			fv->flags = flags;
+		}
 }
 #endif

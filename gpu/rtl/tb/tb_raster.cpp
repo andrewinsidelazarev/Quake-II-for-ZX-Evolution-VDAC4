@@ -18,6 +18,9 @@
 //
 // Итог — «ПРОШЛО» с числом многоугольников, точек и тактов, или первое расхождение с подробностями.
 #include "Vbz_raster.h"
+#ifdef TB_DBG
+#include "Vbz_raster___024root.h"   // внутренние сигналы (сборка с --public-flat-rw)
+#endif
 #include "verilated.h"
 
 #include <cstdint>
@@ -179,6 +182,15 @@ int main (int argc, char **argv)
 				if (pi >= polys.size () || got != polys[pi].pix.size () || top->out_tag != (pi & 1)) {
 					printf ("кадр %d: метка конца не к месту (многоугольник %zu из %zu, точка %zu, метка %d)\n", frame,
 					        pi, polys.size (), got, (int)top->out_tag);
+					if (pi < polys.size ()) {   // 27.11.2026: что за многоугольник (вершины Q12.4, ножницы, точек у модели)
+						const Poly &q = polys[pi];
+						printf ("  n %d, режим %04x, ножницы (%d,%d)-(%d,%d), точек у модели %zu\n", q.n, q.mode,
+						        q.sx0, q.sy0, q.sx1, q.sy1, q.pix.size ());
+						for (int v = 0; v < q.n; v++)
+							printf ("  v%d: x %d (%.2f) y %d (%.2f)\n", v, (int)(int16_t)(q.xy[v] & 0xFFFF),
+							        (int16_t)(q.xy[v] & 0xFFFF) / 16.0, (int)(int16_t)(q.xy[v] >> 16),
+							        (int16_t)(q.xy[v] >> 16) / 16.0);
+					}
 					return 1;
 				}
 				npix += got;
@@ -223,6 +235,19 @@ int main (int argc, char **argv)
 			top->clk = 1;
 			top->eval ();
 			cycles++;
+#ifdef TB_DBG
+			// 27.11.2026: трасса регистров R1 на кадре RASTER_DBG (первые 400 тактов кадра)
+			if (getenv ("RASTER_DBG") && frame == atoi (getenv ("RASTER_DBG")) && cycles - c0 < 400) {
+				auto *r = top->rootp;
+				printf ("t%llu e_st %d ey %d ey1 %d top %d bot %d a %d>%d b %d>%d ph %d/%d dv %d/%d de %d/%d dq %d/%d sp_v %d l %d r %d pn %d\n",
+				        (unsigned long long)(cycles - c0), r->bz_raster__DOT__e_st, (int)r->bz_raster__DOT__ey, (int)r->bz_raster__DOT__ey1,
+				        r->bz_raster__DOT__top, r->bz_raster__DOT__bot, r->bz_raster__DOT__a0, r->bz_raster__DOT__a1,
+				        r->bz_raster__DOT__b0, r->bz_raster__DOT__b1, r->bz_raster__DOT__ph[0], r->bz_raster__DOT__ph[1],
+				        r->bz_raster__DOT__dv[0], r->bz_raster__DOT__dv[1], r->bz_raster__DOT__de[0], r->bz_raster__DOT__de[1],
+				        (int)r->bz_raster__DOT__dq[0], (int)r->bz_raster__DOT__dq[1], r->bz_raster__DOT__sp_v,
+				        (int)(int16_t)r->bz_raster__DOT__sp_l, (int)(int16_t)r->bz_raster__DOT__sp_r, r->bz_raster__DOT__pn);
+			}
+#endif
 			if (take_ld)
 				lpos++;
 			if (take_in) {

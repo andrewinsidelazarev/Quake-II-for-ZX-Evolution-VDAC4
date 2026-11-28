@@ -504,7 +504,7 @@ module bz_top (
             lk_rd_data = rb_q;                                           // окно 0x1000…0x1FFC
         else case (lk_rd_addr)
             12'h000: lk_rd_data = 32'h5644_4334;                         // «VDC4»
-            12'h001: lk_rd_data = {8'h51, 8'h01, 16'h0003};              // 'Q', LINK 1, версия 0.03
+            12'h001: lk_rd_data = {8'h51, 8'h01, 16'h0004};              // 'Q', LINK 1, версия 0.04 (ножницы со знаком)
             12'h002: lk_rd_data = {25'd0, rd_busy, msel_s[2], armed, boot_req, mem_ready, bad_cmd, fifo_ovf};
             12'h003: lk_rd_data = {20'd0, fifo_free};
             12'h007: lk_rd_data = {8'h47, 12'd0, free_gray_q};          // FREE_GRAY (0.03)

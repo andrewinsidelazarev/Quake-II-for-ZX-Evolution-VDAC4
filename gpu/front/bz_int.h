@@ -71,6 +71,30 @@ static inline uint32_t fx32 (bzr v)
 	return (uint32_t)(int64_t)bz_floor (v + BZR(0.5));
 }
 
+/* Чей вызов (28.11.2026, модели на втором ядре ESP — bz_front.c, «МОДЕЛИ НА ЯДРЕ 0»): 0 — игра (ядро ESP 1: мир,
+ * небо, 2D, всё прочее), 1 — модели (задача LINK на ядре ESP 0). У сторон свои буферы команд (cb) и счётчики
+ * (fs); текстуры моделей берутся из таблицы кадра (ent_tex), а не из общей таблицы — её в это время меняет мир.
+ * На ПК сторона 1 — поток моделей q2esp.exe (bz_ent 2) или их проход заранее (bz_ent 1). */
+#if defined __XTENSA__
+/* ESP: сторона 1 — это код на стеке задачи LINK (bz_e_sp: {начало, длина}, ставит её задача, bz_link.c). Не по номеру
+ * ядра (PRID): Unreal NG эмулирует одно ядро с PRID 0xCDCD у всех задач — там игра сочла бы себя моделями. */
+static inline int bz_ectx_sp (const volatile uint32_t *r)
+{
+	uint32_t sp;
+
+	__asm__ volatile ("mov %0, a1" : "=a"(sp));
+	return sp - r[0] < r[1];
+}
+extern volatile uint32_t bz_e_sp[2];      /* bz_front.c; в горячем модуле — q2h.e_sp (q2hot_remap.h) */
+#define bz_ectx() bz_ectx_sp (bz_e_sp)
+#elif defined _MSC_VER
+extern __declspec(thread) int bz_ectx_pc;
+#define bz_ectx() bz_ectx_pc
+#else
+extern __thread int bz_ectx_pc;
+#define bz_ectx() bz_ectx_pc
+#endif
+
 #define BZ_NEAR     0.6f            /* ближняя плоскость: zi ≤ 1,67 влезает в Q2.30          */
 #define MAXFV       80              /* вершин у грани после отсечения                        */
 
@@ -180,7 +204,7 @@ extern float    s_ziscale;
 /* ---------------------------------------------------------------- таблицы горячего модуля */
 
 /* Меняется при любой правке таблиц или типов выше: модуль другой версии не подключится. */
-#define Q2HOT_ABI 3
+#define Q2HOT_ABI 5   /* 4 (27.11.2026): bz_guard_left; 5 (28.11.2026): стороны cb_ctx/fs_ctx, ent_tex, ent_tick */
 
 /* Размеры типов, которые видят обе сборки: модуль сверяет их со своими — разойтись они могут, только если
  * Q2.ELF и Q2HOT.ELF собраны из разных исходников (тогда модуль отказывается, игра идёт без него). */
@@ -197,15 +221,16 @@ typedef struct
 	uint32_t      sizes[Q2HOT_NSIZES];
 
 	/* данные переднего края (bz_front.c) */
-	cbuf_t      **cb;
+	cbuf_t      **cb_ctx;          /* [bz_ectx ()] — текущий буфер стороны */
 	cbuf_t       *cb_sky;
-	bz_fstat_t   *fs;
+	bz_fstat_t   *fs_ctx;          /* [bz_ectx ()] */
 	bz_mapa_t    *mapa;
 	bz_ab_t      *ab;
 	texent_t     *texhash;
 	uint32_t     *tex_page_frame;
 	uint32_t     *tex_frame;
 	image_t     **bz_alias_skin;
+	int          *bz_guard_left;
 
 	/* функции переднего края (bz_front.c) */
 	void        (*put_full) (uint32_t v);
@@ -215,6 +240,9 @@ typedef struct
 	lment_t      *lmhash;
 	uint64_t     *lm_total;
 	void        (*BZ_CalcGradients) (msurface_t *pface, int mip);
+	texent_t   *(*ent_tex) (image_t *img, int mip, int w, int h, int lin);   /* сторона 1: текстура из таблицы кадра */
+	volatile uint32_t *e_sp;      /* ESP: {начало, длина} стека задачи LINK — по нему bz_ectx (сторона 1) */
+	void        (*ent_tick) (void);   /* сторона 1: дать задаче LINK отправить своё (не чаще ~150 мкс) */
 
 	/* данные рендера id */
 	model_t     **currentmodel;
@@ -231,7 +259,7 @@ typedef struct
 	int          *sadjust, *tadjust;
 	int          *r_aliasblendcolor;
 	affinetridesc_t *r_affinetridesc;
-	entity_t    **currententity;
+	entity_t    **ecur;             /* модель, что рисуется (копия currententity у моделей — bz_ent.h) */
 	float        *r_lerp_frontv, *r_lerp_backv, *r_lerp_move, *r_plightvec;
 	float       (*r_avertexnormals)[3];
 	float       (*aliastransform)[4];

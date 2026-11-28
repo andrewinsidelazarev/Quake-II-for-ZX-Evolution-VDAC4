@@ -13,15 +13,16 @@
 #define Q2HOT_REMAP_H
 
 /* данные переднего края (bz_front.c) */
-#define cb                    (*q2h.cb)
+#define cb                    (q2h.cb_ctx[bz_ectx ()])
 #define cb_sky                (*q2h.cb_sky)
-#define fs                    (*q2h.fs)
+#define fs                    (q2h.fs_ctx[bz_ectx ()])
 #define mapa                  (*q2h.mapa)
 #define ab                    (*q2h.ab)
 #define texhash               (q2h.texhash)
 #define tex_page_frame        (q2h.tex_page_frame)
 #define tex_frame             (*q2h.tex_frame)
 #define bz_alias_skin         (*q2h.bz_alias_skin)
+#define bz_guard_left         (*q2h.bz_guard_left)
 
 /* функции переднего края (bz_front.c) */
 #define put_full              (q2h.put_full)
@@ -31,6 +32,9 @@
 #define lmhash                (q2h.lmhash)
 #define lm_total              (*q2h.lm_total)
 #define BZ_CalcGradients      (q2h.BZ_CalcGradients)
+#define ent_tex               (q2h.ent_tex)
+#define ent_tick              (q2h.ent_tick)
+#define bz_e_sp               (q2h.e_sp)
 
 /* данные рендера id */
 #define currentmodel          (*q2h.currentmodel)
@@ -62,7 +66,7 @@
 #define tadjust               (*q2h.tadjust)
 #define r_aliasblendcolor     (*q2h.r_aliasblendcolor)
 #define r_affinetridesc       (*q2h.r_affinetridesc)
-#define currententity         (*q2h.currententity)
+#define e_currententity       (*q2h.ecur)
 #define r_lerp_frontv         (q2h.r_lerp_frontv)
 #define r_lerp_backv          (q2h.r_lerp_backv)
 #define r_lerp_move           (q2h.r_lerp_move)

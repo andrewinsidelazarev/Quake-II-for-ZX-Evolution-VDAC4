@@ -49,7 +49,13 @@ void *q2_malloc (size_t n)
 
 	/* Не хватило: пока идёт загрузка карты, рендер может отдать модель прошлой карты
 	 * (R_EspPurgeStale, p06) — по одной, самую большую, и снова попробовать. */
-	while (!p && q2_mem_reclaim ())
+	while (!p && R_EspPurgeStale ())
+		p = q2_core->alloc (n ? n : 1, ZM_MEM_PSRAM);
+	/* 27.11.2026 (плата board_log35): куча раздроблена — одолжить кусок у запасных буферов кадра (bz_front.c,
+	 * до 64 КБ подряд; вернётся в q2_free), и только потом отдать их насовсем. */
+	if (!p)
+		p = BZ_Borrow ((uint32_t)n);
+	while (!p && BZ_ReleaseSpare ())
 		p = q2_core->alloc (n ? n : 1, ZM_MEM_PSRAM);
 	if (!p)
 		out_of_memory ("malloc", n);
@@ -72,6 +78,15 @@ void *q2_realloc (void *p, size_t n)
 	void *q;
 	if (!p)
 		return q2_malloc (n);
+	if (BZ_BorrowedSize (p))
+	{
+		/* одолженный у буферов кадра (q2_malloc) — в новый кусок, одолженный — вернуть */
+		uint32_t had = BZ_BorrowedSize (p);
+		q = q2_malloc (n);
+		memcpy (q, p, had < n ? had : n);
+		BZ_Unborrow (p);
+		return q;
+	}
 	q = q2_core->realloc (p, n ? n : 1);
 	while (!q && q2_mem_reclaim ())	/* как в q2_malloc: модели прошлой карты — прочь */
 		q = q2_core->realloc (p, n ? n : 1);
@@ -82,7 +97,7 @@ void *q2_realloc (void *p, size_t n)
 
 void q2_free (void *p)
 {
-	if (p)
+	if (p && !BZ_Unborrow (p))
 		q2_core->free (p);
 }
 

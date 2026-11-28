@@ -592,7 +592,7 @@ ESP = {
          '\t\tfseek (f, at, SEEK_SET);\n'
          '\t\treturn 0;\n'
          '\t}\n'
-         '\tBZ_StoreMark ();\t\t\t// ESP: перед первым чтением — дождаться, что ядро всё записало\n'
+         '\tBZ_StoreMarkModel ();\t\t// ESP: перед первым чтением — дождаться, что ядро всё записало (метка кадров md2)\n'
          '\tmod->md2_sdram = addr;\n'
          '\tmod->md2_span = span;\n'
          '\tmod->md2_nspan = ngroups;\n'
@@ -842,6 +842,20 @@ ESP = {
         ('\tBZ_FadeScreen ();\t// ref_bz\n',
          '\tBZ_FadeScreen ();\t// ref_bz\n\treturn;\t\t\t\t\t\t\t// ref_esp\n'),
     ],
+    # 28.11.2026 («разгрузить тяжёлые кадры»): частица — без double (у ESP32-S3 он программный). 1/z во float — то же
+    # частное (53 ≥ 2·24 + 2: двойное округление безвредно); (int)(x + 0.5) с суммой в double — esp_round_half, то же
+    # целое: |x| < 2^23 — сумма во float точна; больше — x целое (x ≥ 0 — x, x < 0 — x + 1).
+    'r_part.c': [
+        ('\tzi = 1.0 / transformed[2];\n'
+         '\tu = (int)(xcenter + zi * transformed[0] + 0.5);\n'
+         '\tv = (int)(ycenter - zi * transformed[1] + 0.5);\n',
+         '\tzi = 1.0f / transformed[2];\t\t\t\t\t\t// ref_esp: без double\n'
+         '\t{\n'
+         '\t\tconst float fu = xcenter + zi * transformed[0], fv = ycenter - zi * transformed[1];\n'
+         '\t\tu = (fu < 8388608.0f && fu > -8388608.0f) ? (int)(fu + 0.5f) : (int)fu + (fu < 0);\n'
+         '\t\tv = (fv < 8388608.0f && fv > -8388608.0f) ? (int)(fv + 0.5f) : (int)fv + (fv < 0);\n'
+         '\t}\n'),
+    ],
 }
 
 
@@ -932,10 +946,176 @@ ESP.setdefault('r_image.c', []).append((
     '\t\tFS_FCloseFile (f);\n'))
 
 
+# 28.11.2026, «Модели на втором ядре» (gpu/front/bz_front.c, «МОДЕЛИ НА ЯДРЕ 0»): непрозрачные модели кадра считает
+# задача LINK на ядре ESP 0, пока игра на ядре 1 обходит мир. Мир по ходу меняет переменные id, которые читают и
+# модели: currententity, currentmodel, modelorg, r_entorigin (у дверей и лифтов — и vpn, vright, vup,
+# view_clipplanes: R_RotateBmodel). Файлы моделей начинаются с gpu/front/bz_ent.h — в них эти имена (и ri: консоль
+# общая) становятся своими копиями e_*, во всём файле разом, вместе с объявлениями r_local.h. Копии определены в
+# r_ent.c (ниже), копии вида кладёт BZ_EntBegin. Другой код этих файлов, который зовёт игра (R_PushDlights,
+# R_MarkLights у r_light.c), переименованных имён не трогает.
+ENT_FIRST = '/*\nCopyright (C) 1997-2001 Id Software, Inc.\n'
+ENT_INCLUDE = ('#include "bz_ent.h"\t// ref_esp (28.11.2026): модели на ядре ESP 0 — свои копии общих переменных id\n'
+               + ENT_FIRST)
+ENT = {
+    'r_alias.c': [
+        (ENT_FIRST, ENT_INCLUDE),
+        # вершины модели в экране — не на стеке (80 КБ: у задачи LINK столько стека нет), а в буфере bz_front.c
+        ('\tfinalvert_t\tfinalverts[MAXALIASVERTS +\n\t\t\t\t\t\t((CACHE_SIZE - 1) / sizeof(finalvert_t)) + 3];\n'
+         '\tfinalvert_t\t*pfinalverts;\n',
+         '\tfinalvert_t\t*pfinalverts;\n'),
+        ('\t// put work vertexes on stack, cache aligned\n\tpfinalverts = (finalvert_t *)\n'
+         '\t\t\t(((long)&finalverts[0] + CACHE_SIZE - 1) & ~(CACHE_SIZE - 1));\n',
+         '\t// ref_esp (28.11.2026): вершины — в буфере bz_front.c (BZ_EntBegin запас место на модели кадра)\n'
+         '\tpfinalverts = (finalvert_t *)BZ_EntVerts (s_pmdl->num_xyz);\n'
+         '\tif (!pfinalverts)\n\t\treturn;\n'),
+    ],
+    'r_sprite.c': [(ENT_FIRST, ENT_INCLUDE)],
+    'r_poly.c': [(ENT_FIRST, ENT_INCLUDE)],
+    'r_light.c': [(ENT_FIRST, ENT_INCLUDE)],
+    'r_main.c': [
+        # модели — со стороны 1 (их куски встают в поток здесь) или, если не отдавались, здесь же, как раньше;
+        # прозрачные — всегда здесь. Проход id — в r_ent.c (E_DrawEntities), прежний текст — как был, не зовётся.
+        ('void R_DrawEntitiesOnList (void)\n{\n',
+         'extern entity_t\t*e_currententity;\n\n'
+         'void R_DrawEntitiesOnList (void)\n{\n'
+         '\tif (!r_drawentities->value)\n\t\treturn;\n'
+         '\t// ref_esp (28.11.2026): непрозрачные модели посчитала сторона 1 (BZ_EntJoin — их куски встают в поток здесь),\n'
+         '\t// иначе — здесь, как раньше; прозрачные — здесь. Без моделей id оставил бы currententity от мира — его\n'
+         '\t// потом читает R_LightPoint (R_SetLightLevel), у которого это e_currententity.\n'
+         '\tif (!BZ_EntJoin ())\n\t\tE_DrawEntities (0);\n'
+         '\te_currententity = currententity;\n'
+         '\tE_DrawEntities (1);\n'
+         '}\n\n'
+         'void R_DrawEntitiesOnList_id (void)\t// ref_esp: прежний проход (у ref_esp его ведёт r_ent.c)\n{\n'),
+        ('\tif (bz_pass)\n\t\tBZ_Begin3D ();\t\t// ref_bz: очистка z, ножницы, фаза волны\n',
+         '\tif (bz_pass)\n\t\tBZ_Begin3D ();\t\t// ref_bz: очистка z, ножницы, фаза волны\n'
+         '\tBZ_EntBegin ();\t\t// ref_esp (28.11.2026): копии вида для моделей; модели — задаче LINK на ядре ESP 0\n'),
+    ],
+}
+
+# r_ent.c: копии переменных id у моделей (bz_ent.h переименовывает имена ниже) и проход моделей id —
+# R_DrawEntitiesOnList, по одному из двух его циклов за вызов.
+R_ENT_C = '''/*
+ * r_ent.c — модели кадра (ref_esp, 28.11.2026; сделан measure/patches/p06_ref_esp.py).
+ * Начинается с bz_ent.h: currententity, vpn и т. д. здесь — копии моделей e_* (gpu/front/bz_front.c, «МОДЕЛИ НА
+ * ЯДРЕ 0»). E_DrawEntities — цикл R_DrawEntitiesOnList id: translucent = 0 — первый (непрозрачные; его может
+ * вести задача LINK на ядре 0), 1 — второй (прозрачные; всегда игра, после мира). Текст циклов — как у id.
+ */
+#include "bz_ent.h"
+#include "r_local.h"
+#include "bz_front.h"
+
+entity_t	*currententity;		// e_currententity и т. д. (bz_ent.h)
+model_t		*currentmodel;
+vec3_t		modelorg, r_entorigin;
+vec3_t		vpn, vright, vup;
+clipplane_t	view_clipplanes[4];
+refimport_t	ri;
+
+void R_DrawNullModel( void );
+
+void TransformVector (vec3_t in, vec3_t out)
+{
+	out[0] = DotProduct(in,vright);
+	out[1] = DotProduct(in,vup);
+	out[2] = DotProduct(in,vpn);
+}
+
+// AngleVectors id (q_shared.c) держит синусы в static — её зовёт и мир (RotatedBBox у дверей и лифтов). Здесь — та же,
+// с переменными на стеке (E_AngleVectors, bz_ent.h).
+void AngleVectors (vec3_t angles, vec3_t forward, vec3_t right, vec3_t up)
+{
+	float		angle;
+	float		sr, sp, sy, cr, cp, cy;
+
+	angle = angles[YAW] * (M_PI*2 / 360);
+	sy = sin(angle);
+	cy = cos(angle);
+	angle = angles[PITCH] * (M_PI*2 / 360);
+	sp = sin(angle);
+	cp = cos(angle);
+	angle = angles[ROLL] * (M_PI*2 / 360);
+	sr = sin(angle);
+	cr = cos(angle);
+
+	if (forward)
+	{
+		forward[0] = cp*cy;
+		forward[1] = cp*sy;
+		forward[2] = -sp;
+	}
+	if (right)
+	{
+		right[0] = (-1*sr*sp*cy+-1*cr*-sy);
+		right[1] = (-1*sr*sp*sy+-1*cr*cy);
+		right[2] = -1*sr*cp;
+	}
+	if (up)
+	{
+		up[0] = (cr*sp*cy+-sr*-sy);
+		up[1] = (cr*sp*sy+-sr*cy);
+		up[2] = cr*cp;
+	}
+}
+
+void E_DrawEntities (int translucent)
+{
+	int			i;
+
+	for (i=0 ; i<r_newrefdef.num_entities ; i++)
+	{
+		currententity = &r_newrefdef.entities[i];
+
+		if ( !( currententity->flags & RF_TRANSLUCENT ) != !translucent )
+			continue;
+		if ( !translucent )
+			BZ_EntTick ();		// сторона 1: задача LINK — своё
+
+		if ( currententity->flags & RF_BEAM )
+		{
+			modelorg[0] = -r_origin[0];
+			modelorg[1] = -r_origin[1];
+			modelorg[2] = -r_origin[2];
+			VectorCopy( vec3_origin, r_entorigin );
+			R_DrawBeam( currententity );
+		}
+		else
+		{
+			currentmodel = currententity->model;
+			if (!currentmodel)
+			{
+				R_DrawNullModel();
+				continue;
+			}
+			VectorCopy (currententity->origin, r_entorigin);
+			VectorSubtract (r_origin, r_entorigin, modelorg);
+
+			switch (currentmodel->type)
+			{
+			case mod_sprite:
+				R_DrawSprite ();
+				break;
+
+			case mod_alias:
+				R_AliasDrawModel ();
+				break;
+
+			default:
+				break;
+			}
+		}
+	}
+}
+'''
+
+
 def make(src, out):
     out = p04_ref_bz.make(src, out)
     for name, pairs in ESP.items():
         p04_ref_bz._patch(pathlib.Path(out) / name, pairs)
+    for name, pairs in ENT.items():
+        p04_ref_bz._patch(pathlib.Path(out) / name, pairs)
+    (pathlib.Path(out) / 'r_ent.c').write_bytes(R_ENT_C.encode('utf-8'))
     return out
 
 

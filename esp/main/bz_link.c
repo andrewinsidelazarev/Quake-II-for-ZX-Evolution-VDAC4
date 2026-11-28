@@ -45,6 +45,7 @@
  *   его регистр SIZE (0x84, старшие биты 0x535A — защита от случайной записи), как NES.ELF.
  */
 #include <stddef.h>
+#include <string.h>
 #include "q2esp.h"
 
 #define BZ_VERSION    0x04u
@@ -94,6 +95,10 @@ static uint32_t sent_words, wait_ms;
 /* 26.11.2026: где время задачи LINK — в тактах (240 МГц): пачки link_burst, чтения места, ожидание места,
  * уступка чтению SDRAM игрой; и число вызовов link_burst (строка «q2: link time» в bz_link_report) */
 static uint32_t lc_burst, lc_free, lc_wait, lc_rd, lc_nburst;
+static uint32_t lc_ent, lc_ewait, ent_runs;   /* модели на ядре 0 (28.11.2026): такты на них (с отправкой изнутри), ждали кусок */
+void BZ_EntRun (void);                       /* bz_front.c: модели кадра (задача LINK) */
+extern volatile uint32_t bz_e_sp[2];         /* bz_front.c: стек этой задачи — сторона моделей (bz_int.h, bz_ectx) */
+extern uint32_t bz_ent_skip[4];              /* bz_front.c: почему модели кадра не отданы задаче (отчёт) */
 static inline uint32_t lc_now (void) { uint32_t c; __asm__ volatile ("rsr.ccount %0" : "=a"(c)); return c; }
 static uint32_t link_free_est;      /* слов в очереди ядра наверняка свободно (0 — не знаем; link_send) */
 static uint32_t read_calls, read_bytes, read_us;   /* итоги чтения SDRAM — в журнал при закрытии */
@@ -232,6 +237,14 @@ int bz_link_wait_mark (uint32_t mark)
 		}
 		q2_core->delay (1);
 	}
+}
+
+/* Ядро уже выполнило MARK с номером mark (одно чтение, без ожидания; модели на ядре 0 — bz_front.c). */
+int bz_link_mark_reached (uint32_t mark)
+{
+	uint32_t got = 0;
+
+	return link_ok && q2_core->link_read (BZ_MARK, &got, 1) == ZM_OK && (int32_t)(got - mark) >= 0;
 }
 
 /*
@@ -429,9 +442,28 @@ static void spin_us (uint32_t us)
 	while (c - c0 < us * 240u);
 }
 
-static int link_send (const uint32_t *words, uint32_t count)
+/* Модели кадра у задачи LINK (28.11.2026, ниже — «МОДЕЛИ НА ЯДРЕ 0»): post — отдала игра, run — начала задача,
+ * done — досчитала; join_seen — сколько меток моделей задача прошла (их куски ушли). Модели кадра начинаются, когда
+ * ушли куски прошлого (иначе новые куски встали бы на место прошлых). Задача, которая ждёт места в очереди ядра,
+ * бросает ожидание, когда можно начать модели. */
+static volatile uint32_t ent_seq_post, ent_seq_run, ent_seq_done, join_seen;
+
+static inline int ent_startable (void)
 {
-	uint32_t spun = 0;
+	return ent_seq_run != ent_seq_post && join_seen == ent_seq_run;
+}
+
+/*
+ * Отправить слова *pw, *pn (сдвигаются на ушедшее), сколько позволяет очередь ядра. wait: 1 — ждать места, пока не
+ * уйдёт всё; 0 — не ждать (вернуть 1, когда очередь полна: модели на ядре 0 шлют между своими делами — bz_link_tick);
+ * 2 — ждать, но вернуть 1, как только игра отдала модели (задача займётся ими, а остаток дошлёт изнутри них).
+ * ZM_OK — ушло всё, ZM_ERROR — LINK.
+ */
+static int link_chunk (const uint32_t **pw, uint32_t *pn, int wait)
+{
+	const uint32_t *words = *pw;
+	uint32_t        count = *pn, spun = 0;
+	int             r = ZM_OK;
 
 	stream_check ();
 	while (count)
@@ -466,14 +498,20 @@ static int link_send (const uint32_t *words, uint32_t count)
 			if (bad)
 			{
 				link_ok = 0;
-				return ZM_ERROR;
+				r = ZM_ERROR;
+				break;
 			}
 			if (f2 < f1)
 				fifo_disagree++;
 			link_free_est = f1 < f2 ? f1 : f2;
 			if (link_free_est < LINK_MIN_FREE && link_free_est < count)
 			{
-				/* мало места: ядро ещё рисует — подождать (см. выше) */
+				/* мало места: ядро ещё рисует — подождать (см. выше) или (модели, новые модели) вернуться */
+				if (!wait || (wait == 2 && ent_startable ()))
+				{
+					r = 1;
+					break;
+				}
 				t0 = q2_core->millis ();
 				c0 = lc_now ();
 				if (spun < LINK_SPIN_US)
@@ -502,24 +540,26 @@ static int link_send (const uint32_t *words, uint32_t count)
 		{
 			/* без ожидания хвоста: следующий обмен по LINK (чтение места, чтение SDRAM игрой) дождётся его сам.
 			 * Окно 0x40000 + 2 КБ транзакции — внутри окна очереди 0x40000…0x7FFFC. */
-			int r = q2_core->link_burst_dma (BZ_FIFO, words, n, ZM_LINK_NOWAIT);
+			int rr = q2_core->link_burst_dma (BZ_FIFO, words, n, ZM_LINK_NOWAIT);
 
-			if (r == ZM_NO_MEMORY)
+			if (rr == ZM_NO_MEMORY)
 			{
 				has_dma = 0;                    /* ничего не послано — дальше link_burst */
 				q2_core->log ("q2: LINK DMA: no buffers (internal RAM) — 16-word bursts");
 				continue;
 			}
-			if (r != ZM_OK)
+			if (rr != ZM_OK)
 			{
 				link_ok = 0;
-				return ZM_ERROR;
+				r = ZM_ERROR;
+				break;
 			}
 		}
 		else if (q2_core->link_burst (BZ_FIFO, words, n) != ZM_OK)
 		{
 			link_ok = 0;
-			return ZM_ERROR;
+			r = ZM_ERROR;
+			break;
 		}
 		lc_burst += lc_now () - c0;
 		lc_nburst++;
@@ -528,7 +568,14 @@ static int link_send (const uint32_t *words, uint32_t count)
 		sent_words += n;
 		link_free_est -= n;
 	}
-	return ZM_OK;
+	*pw = words;
+	*pn = count;
+	return r;
+}
+
+static int link_send (const uint32_t *words, uint32_t count)
+{
+	return link_chunk (&words, &count, 1);
 }
 
 /* Раз в 5 с (q2_app.c, 26.11.2026): слов в ядро за кадр и сколько задача LINK ждала места в очереди ядра
@@ -557,6 +604,24 @@ void bz_link_report (int frames)
 		              (unsigned)(lc_wait / k / 1000u), (unsigned)(lc_wait / k % 1000u / 100u),
 		              (unsigned)(lc_rd / k / 1000u), (unsigned)(lc_rd / k % 1000u / 100u));
 	}
+	/* 28.11.2026: модели на ядре 0 — сколько кадров и время задачи на них (вместе с отправкой изнутри них), из него —
+	 * ожидание свободного куска */
+	if (frames > 0)
+	{
+		static uint32_t runs0;
+		const uint32_t  k = 240u * (uint32_t)frames;
+		static uint32_t sk0[4];
+		q2_core->log ("q2: models on core 0: %u of %u frames, ms/frame %u.%u, waiting for a chunk %u.%u; not given: "
+		              "no models %u, no task %u, no verts %u, md2 %u",
+		              (unsigned)(ent_runs - runs0), (unsigned)frames,
+		              (unsigned)(lc_ent / k / 1000u), (unsigned)(lc_ent / k % 1000u / 100u),
+		              (unsigned)(lc_ewait / k / 1000u), (unsigned)(lc_ewait / k % 1000u / 100u),
+		              (unsigned)(bz_ent_skip[0] - sk0[0]), (unsigned)(bz_ent_skip[1] - sk0[1]),
+		              (unsigned)(bz_ent_skip[2] - sk0[2]), (unsigned)(bz_ent_skip[3] - sk0[3]));
+		memcpy (sk0, bz_ent_skip, sizeof(sk0));
+		runs0 = ent_runs;
+	}
+	lc_ent = lc_ewait = 0;
 	lc_burst = lc_free = lc_wait = lc_rd = lc_nburst = 0;
 	words0 = words;
 	wait0 = wait;
@@ -602,14 +667,38 @@ int bz_link_send (const uint32_t *words, uint32_t count)
  * когда заняты все. Порядок слов тот же: задача шлёт буферы по очереди. Счётчики tq_put (пишет игра) и
  * tq_done (пишет задача) — каждый своей стороной; в отправке — tq_put − tq_done.
  */
+/*
+ * МОДЕЛИ НА ЯДРЕ 0 (28.11.2026; bz_front.c — там же, зачем и что у моделей своё). Пока очередь ядра полна (12–19 мс
+ * кадра, board_log41–42), задача не крутится вхолостую, а считает непрозрачные модели кадра (BZ_EntRun): игра
+ * отдаёт их перед миром (bz_link_ent_post) и обходит мир сама. Модели пишут в свои куски (eq_*, ENT_CHUNKS по
+ * ENT_WORDS — память bz_front.c) и время от времени (bz_link_tick, не чаще LINK_TICK_US) шлют, что можно, не ожидая
+ * места: буферы мира — как раньше, по очереди. Куски моделей идут в поток только на своём месте: дойдя до моделей
+ * (после мира и неба), игра ставит в очередь метку (tq_w = NULL, bz_link_ent_join) — задача, дойдя до неё, шлёт
+ * куски по порядку (и дописанные потом), а дальше — буферы игры за меткой. Порядок слов — тот же, что у одного
+ * потока, где модели шли бы после неба. Нет свободного куска — модели ждут (шлют, что есть; до метки — игру).
+ */
 #define TQ_MAX 4
-static void          *tx_work, *tx_done;
-static const uint32_t *tq_w[TQ_MAX];
+#define EQ_MAX 8
+#define LINK_TICK_US 200u        /* модели отдают время отправке не чаще этого (чтение места — ~22 мкс) */
+static void          *tx_work, *tx_done, *ent_sig;
+static const uint32_t *tq_w[TQ_MAX];     /* NULL — метка моделей */
 static uint32_t       tq_n[TQ_MAX];
 static volatile uint32_t tq_put, tq_done;
+static volatile uint32_t tq_jput;        /* меток моделей поставлено (игра); пройдено — join_seen (задача) */
 static int            tx_depth = 1;
 static volatile int   tx_quit, tx_alive, tx_err;
 static int            tx_state;          /* 0 — не заводилась, 1 — работает, -1 — не вышло (шлём сами) */
+static int            tx_big;            /* стек задачи — под модели (иначе моделей ей не давать) */
+/* куски моделей (bz_link_ent_pool) и их очередь: оба счётчика ведёт задача */
+static uint32_t      *eq_pool, eq_words, eq_chunks;
+static uint32_t       eq_n[EQ_MAX];
+static uint32_t       eq_put, eq_get;
+static int            in_join;           /* задача дошла до метки — шлёт куски моделей */
+/* что шлётся сейчас: 1 — буфер игры (tq_done), 2 — кусок моделей (eq_get) */
+static const uint32_t *cur_w;
+static uint32_t       cur_n;
+static int            cur_kind;
+static uint32_t       tick_at;
 
 /* Сколько буферов может быть в отправке разом (1…TQ_MAX): столько буфер кадра держит в запасе. */
 void bz_link_set_depth (int depth)
@@ -617,44 +706,215 @@ void bz_link_set_depth (int depth)
 	tx_depth = depth < 1 ? 1 : depth > TQ_MAX ? TQ_MAX : depth;
 }
 
+/* Один шаг отправки: следующее по порядку (буфер игры, метка, куски моделей) и сколько его уйдёт (wait —
+ * как у link_chunk). 0 — слать нечего, 1 — что-то ушло или кончилось, 2 — очередь ядра полна (не ждали). */
+static int sink_step (int wait)
+{
+	int r;
+
+	if (!cur_kind)
+	{
+		if (in_join)
+		{
+			if (eq_get != eq_put)
+			{
+				uint32_t i = eq_get % eq_chunks;
+
+				cur_w = eq_pool + i * eq_words;
+				cur_n = eq_n[i];
+				cur_kind = 2;
+			}
+			else if (ent_seq_run == join_seen + 1 && ent_seq_done == ent_seq_run)
+			{
+				/* модели этой метки досчитаны и ушли — метка пройдена; сначала её счёт, потом общий (tx_wait_below) */
+				in_join = 0;
+				join_seen++;
+				__sync_synchronize ();
+				tq_done++;
+				q2_core->signal_give (tx_done);
+				return 1;
+			}
+			else
+				return 0;           /* модели ещё считаются (или не начаты) — их ведёт эта же задача */
+		}
+		else if (tq_done != tq_put)
+		{
+			uint32_t i = tq_done % TQ_MAX;
+
+			if (!tq_w[i])
+			{
+				in_join = 1;
+				return 1;
+			}
+			cur_w = tq_w[i];
+			cur_n = tq_n[i];
+			cur_kind = 1;
+		}
+		else
+			return 0;
+	}
+	Q2M_BEGIN (Q2M_LINK);
+	r = link_chunk (&cur_w, &cur_n, wait);
+	Q2M_END (Q2M_LINK);
+	if (r == ZM_ERROR)
+	{
+		tx_err = 1;
+		cur_n = 0;
+	}
+	if (!cur_n)
+	{
+		if (cur_kind == 1)
+		{
+			__sync_synchronize ();
+			tq_done++;
+			q2_core->signal_give (tx_done);
+		}
+		else
+			eq_get++;
+		cur_kind = 0;
+		return 1;
+	}
+	return r == 1 ? 2 : 1;
+}
+
 static void tx_task (void *arg)
 {
+	/* стек задачи (arg ≠ NULL — 16 КБ) — сторона моделей (bz_ectx, bz_int.h): от вершины (рядом с этим кадром) на 16 КБ
+	 * вниз. Признак — аргументом, а не tx_big: задача может начаться раньше, чем task_start вернётся. */
+	if (arg)
+	{
+		volatile uint32_t here = 0;
+
+		bz_e_sp[0] = (uint32_t)(uintptr_t)&here - 16384u;
+		bz_e_sp[1] = 16384u + 256u;
+	}
 	(void)arg;
 	while (!tx_quit)
 	{
-		uint32_t i;
-
-		if (tq_done == tq_put)
+		if (ent_startable ())
 		{
-			q2_core->signal_wait (tx_work, 100);
+			uint32_t c0 = lc_now ();
+
+			ent_seq_run = ent_seq_post;
+			__sync_synchronize ();
+			BZ_EntRun ();               /* bz_front.c: модели кадра; внутри — bz_link_tick, bz_link_ent_chunk */
+			lc_ent += lc_now () - c0;
+			ent_runs++;
 			continue;
 		}
-		i = tq_done % TQ_MAX;
-		if (bz_link_send (tq_w[i], tq_n[i]) != ZM_OK)
-			tx_err = 1;
-		__sync_synchronize ();
-		tq_done++;
-		q2_core->signal_give (tx_done);
+		if (!sink_step (2))
+			q2_core->signal_wait (tx_work, 100);
 	}
+	bz_e_sp[1] = 0;
 	tx_alive = 0;
 }
 
-/* Дождаться, что в отправке не больше limit буферов. */
+/* Модели (внутри BZ_EntRun, задача LINK): пора — отправить, что можно, не ожидая места в очереди ядра. */
+void bz_link_tick (void)
+{
+	uint32_t c = lc_now (), k;
+
+	if (c - tick_at < LINK_TICK_US * 240u)
+		return;
+	tick_at = c;
+	for (k = 0; k < 4 && sink_step (0) == 1; k++)
+		;
+}
+
+/* Модели: кусок full (n слов; NULL — первый) полон — в очередь кусков; дать следующий свободный. Свободного нет
+ * (все ждут метки или уходят) — слать, что есть, а до метки — ждать игру. */
+uint32_t *bz_link_ent_chunk (uint32_t *full, uint32_t n)
+{
+	if (full)
+	{
+		eq_n[eq_put % eq_chunks] = n;
+		eq_put++;
+	}
+	if (eq_put - eq_get >= eq_chunks)
+	{
+		uint32_t c0 = lc_now ();
+
+		while (eq_put - eq_get >= eq_chunks)
+			if (!sink_step (1))
+				q2_core->signal_wait (tx_work, 1);
+		lc_ewait += lc_now () - c0;
+	}
+	return eq_pool + (eq_put % eq_chunks) * eq_words;
+}
+
+/* Модели кадра кончились: последний кусок — в очередь, игре — «готово» (bz_link_ent_join). */
+void bz_link_ent_end (uint32_t *last, uint32_t n)
+{
+	if (last && n)
+	{
+		eq_n[eq_put % eq_chunks] = n;
+		eq_put++;
+	}
+	__sync_synchronize ();
+	ent_seq_done = ent_seq_run;
+	q2_core->signal_give (ent_sig);
+}
+
+/* Куски для моделей (bz_front.c, до первой карты; NULL — их нет, модели рисует игра). Не во время моделей. */
+void bz_link_ent_pool (uint32_t *pool, int chunks, uint32_t words)
+{
+	eq_pool = pool;
+	eq_chunks = pool ? (uint32_t)(chunks > EQ_MAX ? EQ_MAX : chunks) : 0;
+	eq_words = words;
+	eq_put = eq_get = 0;
+}
+
+/* Задаче LINK можно отдавать модели: она работает, у неё стек под них, есть куски, LINK цел. */
+int bz_link_ent_ok (void)
+{
+	return tx_state > 0 && tx_big && eq_pool && eq_chunks && link_ok && !tx_err;
+}
+
+/* Игра: модели кадра — задаче (bz_front.c уже положил всё, что им нужно). */
+void bz_link_ent_post (void)
+{
+	__sync_synchronize ();
+	ent_seq_post++;
+	q2_core->signal_give (tx_work);
+}
+
+/* Игра, на месте моделей: метка в очередь; ждать, пока задача досчитает модели (их куски уйдут за меткой). */
+void bz_link_ent_join (void)
+{
+	while (tq_put - tq_done >= TQ_MAX)
+		q2_core->signal_wait (tx_done, 20);
+	tq_jput++;
+	tq_w[tq_put % TQ_MAX] = NULL;
+	tq_n[tq_put % TQ_MAX] = 0;
+	__sync_synchronize ();
+	tq_put++;
+	q2_core->signal_give (tx_work);
+	while (ent_seq_done != ent_seq_post)
+		q2_core->signal_wait (ent_sig, 20);
+}
+
+/* Дождаться, что в отправке не больше limit буферов (метка моделей — не буфер). */
 static void tx_wait_below (uint32_t limit)
 {
-	if (tq_put - tq_done > limit)
+	if (tq_put - tq_done - (tq_jput - join_seen) > limit)
 	{
 		Q2M_BEGIN (Q2M_LWAIT);
-		while (tq_put - tq_done > limit)
+		while (tq_put - tq_done - (tq_jput - join_seen) > limit)
 			q2_core->signal_wait (tx_done, 20);
 		Q2M_END (Q2M_LWAIT);
 	}
 }
 
-/* Дождаться, что задача LINK отправила всё отданное. ZM_ERROR — отправка не удалась. */
+/* Дождаться, что задача LINK отправила всё отданное (и куски моделей за меткой). ZM_ERROR — отправка не удалась. */
 int bz_link_wait_idle (void)
 {
-	tx_wait_below (0);
+	if (tq_put != tq_done)
+	{
+		Q2M_BEGIN (Q2M_LWAIT);
+		while (tq_put != tq_done)
+			q2_core->signal_wait (tx_done, 20);
+		Q2M_END (Q2M_LWAIT);
+	}
 	return tx_err ? ZM_ERROR : ZM_OK;
 }
 
@@ -667,16 +927,31 @@ int bz_link_send_async (const uint32_t *words, uint32_t count)
 		tx_state = -1;
 		tx_work = q2_core->signal_create ();
 		tx_done = q2_core->signal_create ();
+		ent_sig = q2_core->signal_create ();
 		tx_quit = tx_err = 0;
 		tq_put = tq_done = 0;
+		tq_jput = join_seen = 0;
+		in_join = cur_kind = 0;
+		cur_n = 0;
+		eq_put = eq_get = 0;
+		ent_seq_post = ent_seq_run = ent_seq_done = 0;
 		tx_alive = 1;
-		if (tx_work && tx_done &&
-		    (q2_core->task_start (tx_task, NULL, 4096, 3, 0) == ZM_OK ||
-		     q2_core->task_start (tx_task, NULL, 4096 | ZM_TASK_STACK_PSRAM, 3, 0) == ZM_OK))
-			tx_state = 1;
-		else
+		/* 28.11.2026: стек — под модели (BZ_EntRun: код id, свет по дереву карты; у id ещё и вершины на стеке —
+		 * у нас они в куче), в PSRAM: внутреннего ОЗУ на 16 КБ нет (свободно ~22 КБ). Не вышло — прежние 4 КБ,
+		 * модели тогда рисует игра. */
+		tx_big = 0;
+		if (tx_work && tx_done && ent_sig)
+		{
+			if (q2_core->task_start (tx_task, (void *)1, 16384u | ZM_TASK_STACK_PSRAM, 3, 0) == ZM_OK)
+				tx_state = tx_big = 1;
+			else if (q2_core->task_start (tx_task, NULL, 4096, 3, 0) == ZM_OK ||
+			         q2_core->task_start (tx_task, NULL, 4096 | ZM_TASK_STACK_PSRAM, 3, 0) == ZM_OK)
+				tx_state = 1;
+		}
+		if (tx_state < 0)
 			tx_alive = 0;
-		q2_core->log ("q2: LINK sender task on core 0: %s", tx_state > 0 ? "running" : "failed, sending inline");
+		q2_core->log ("q2: LINK sender task on core 0: %s%s", tx_state > 0 ? "running" : "failed, sending inline",
+		              tx_state > 0 ? (tx_big ? ", models on core 0" : ", small stack — models on core 1") : "");
 	}
 	if (tx_state < 0)
 		return bz_link_send (words, count);
@@ -703,6 +978,8 @@ void bz_link_close (void)
 		for (t0 = q2_core->millis (); tx_alive && q2_core->millis () - t0 < 500; )
 			q2_core->delay (5);
 		tx_state = 0;
+		if (ent_runs)
+			q2_core->log ("q2: models on core 0: %u frames", (unsigned)ent_runs);
 	}
 	if (has_dma && link_ok && q2_core->link_burst_wait () != ZM_OK)
 		q2_core->log ("q2: LINK DMA: last burst did not finish");

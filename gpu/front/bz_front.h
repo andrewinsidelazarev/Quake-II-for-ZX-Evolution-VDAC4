@@ -47,7 +47,8 @@ int         BZ_StoreAvailable (void);
 uint32_t    BZ_StoreAlloc (uint32_t bytes);                     /* адрес (кратен 32) или 0 — нет места */
 void        BZ_StoreFree (uint32_t addr, uint32_t bytes);
 void        BZ_StoreWrite (uint32_t addr, const void *data, uint32_t bytes);
-void        BZ_StoreMark (void);                                /* после загрузки модели */
+void        BZ_StoreMark (void);                                /* после записи в хранилище (звук) */
+void        BZ_StoreMarkModel (void);                           /* то же после кадров md2 (r_model.c, p06) */
 void        BZ_StoreRead (uint32_t addr, void *dst, uint32_t bytes);   /* звук: адрес кратен 4 */
 uint32_t    BZ_StoreGeneration (void);                          /* раскладка SDRAM (звук — перечитать) */
 uint32_t    BZ_StoreBytes (void);
@@ -78,6 +79,13 @@ int  BZ_AliasModelTris (void *pmdl, void *pfinalverts, int reverse, int kind);
 void BZ_HotTables (void **imp, void **exp);
 int  BZ_HotUse (int on);
 void BZ_Particle (int u, int v, float zi, int pix, int color, int level);
+/* Модели на ядре ESP 0 (28.11.2026, bz_front.c «МОДЕЛИ НА ЯДРЕ 0»; r_main.c, r_ent.c, r_alias.c — p06) */
+void  BZ_EntBegin (void);          /* перед миром: копии вида; модели — стороне 1 */
+int   BZ_EntJoin (void);           /* на месте моделей: 1 — их посчитала сторона 1 */
+void  BZ_EntTick (void);           /* сторона 1, внутри моделей: задача LINK — своё */
+void *BZ_EntVerts (int n);         /* вершины модели в экране (у id — на стеке) */
+void  BZ_EntPrintf (int print_level, char *fmt, ...);   /* Con_Printf моделей */
+void  E_DrawEntities (int translucent);                 /* r_ent.c: цикл R_DrawEntitiesOnList id */
 void BZ_DrawPoly (int iswater, int blendcolor);
 void BZ_CalcGradients (struct msurface_s *pface, int mip);   /* в r_edge.c: miplevel там static */
 

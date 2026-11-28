@@ -44,7 +44,8 @@ STAGE = Path(r'E:\zx\cache\tmp\q2esp\package')
 # Ядро 0.02 (24.11.2026, SPEC 0.4: кадры md2 — в SDRAM ядра, чтение по LINK) — выпуск с README и отчётами
 # Gowin в gpu/rtl/release (раньше — сборка d прямо из стадии в кэше, ядро 0.01)
 # Ядро 0.03 (24.11.2026): FIFO_FREE в коде Грея (LINK 0x1C), запись цвета в F без adv — тайминг
-DEFAULT_CORE = ROOT / 'gpu' / 'rtl' / 'release' / '0.03' / 'Q2.BIN'
+# Ядро 0.04 (27.11.2026): ножницы растеризатора со знаком (вершины левее окна), ступень H кэша текстур — тайминг
+DEFAULT_CORE = ROOT / 'gpu' / 'rtl' / 'release' / '0.04' / 'Q2.BIN'
 DIST = ROOT / 'dist' / 'Q2'
 SPG_NAME = '_Q2.SPG'              # имя запускателя на карте Evo (первым в списке Wild Commander)
 

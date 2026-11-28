@@ -408,6 +408,8 @@ static void zone_report (void)
  * начале каждой строки журнала (psram=, psram_min=). Здесь нет жадного захвата всей кучи, как в
  * q2_mem_report: игра идёт, и другим задачам ESP память может понадобиться в любой миг. Зачем (плата,
  * 24.11.2026): Quake 2 упал на base2 без памяти — по таким строкам видно, сколько запаса у каждой карты. */
+#define MAP_KEEP_LARGEST (128u << 10)
+
 void q2_map_report (void)
 {
 	extern int z_count, z_bytes;
@@ -416,6 +418,16 @@ void q2_map_report (void)
 	int        nmodels;
 
 	R_EspModelBytes (&models, &nmodels);
+	/* 28.11.2026, проверка памяти (пользователь: «делай тест на свободную память — не свободно — освобождай»; плата
+	 * board_log43 — base2 не загрузилась): после карты самый большой свободный кусок PSRAM меньше MAP_KEEP_LARGEST —
+	 * куски моделей на ядре 0 (48 КБ, хвост буфера кадра) отдаются куче, модели дальше рисует игра. */
+	{
+		uint32_t largest = mem_largest ();
+
+		if (largest < MAP_KEEP_LARGEST && BZ_EntRelease ())
+			q2_core->log ("q2: memory test: PSRAM largest %u KB < %u — model chunks given back, models on core 1",
+			              (unsigned)(largest >> 10), (unsigned)(MAP_KEEP_LARGEST >> 10));
+	}
 	/* коротко: журнал ESP обрезает длинные строки (Unreal NG — после ~140 знаков) */
 	q2_core->log ("q2: map: PSRAM max %u KB; level %u/%u KB; zone %u KB/%d; models %u KB/%d; cmd %u KB; md2 SDRAM %u KB",
 	              (unsigned)(mem_largest () >> 10), (unsigned)(level_used >> 10), (unsigned)(level_size >> 10),

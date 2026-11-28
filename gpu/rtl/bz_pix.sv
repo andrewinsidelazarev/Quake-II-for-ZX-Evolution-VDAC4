@@ -11,14 +11,15 @@
 //   (режимы SOLID, ZRAW, NOCOL ниже).
 //
 // КОНВЕЙЕР
-//   Точка проходит семь ступеней, по такту на каждую; в каждой ступени — своя точка, все семь
-//   работают одновременно, как рабочие на ленте. Поэтому, хотя на одну точку уходит 7 тактов, из
+//   Точка проходит восемь ступеней, по такту на каждую; в каждой ступени — своя точка, все восемь
+//   работают одновременно, как рабочие на ленте. Поэтому, хотя на одну точку уходит 8 тактов, из
 //   конвейера выходит по точке за такт.
 //     A — вход: z в 16 бит, номер точки в кадре y·S + x, клетка lightmap (синус волны читается уже);
 //     B — волна (s, t + синус), координаты текселя (повтор или зажим), адреса клеток lightmap;
 //     T — начало строки текселя, адреса z и цвета в SDRAM, чтение четырёх клеток lightmap;
 //     C — адрес текселя, чтение кэша текстур, первая половина смешивания клеток lightmap;
-//     D — попадание в кэш текстур (промах — «стоп», строка грузится из SDRAM), строка света 0…63;
+//     H — метки кэша текстур с выхода BSRAM: попадание; строка света 0…63 (ступень с 27.11.2026);
+//     D — промах кэша текстур — «стоп», строка грузится из SDRAM;
 //     E — кусок z: тест и запись z; ключ (тексель 255 прозрачен); чтение colormap;
 //     F — кусок цвета: прозрачность (alphamap), запись цвета.
 //
@@ -469,19 +470,31 @@ module bz_pix (
 
     // кэш текстур: 128 наборов × 2 пути × строка 32 байта. Набор — биты адреса [11:5], метка — [22:12].
     // Метки двух путей набора — в одном слове: {есть1, метка1, есть0, метка0}.
+    //
+    // 27.11.2026 (ядро 0.04): попадание считается в отдельной ступени H, в D оно уже в регистре.
+    // Раньше слово меток с выхода BSRAM (~2,3 нс после фронта) сравнивалось в D и в том же такте
+    // решало st_d → adv, а adv — разрешение сотен регистров (буфер bz_skid, z-кусок, умножители):
+    // в сборке 0.04 так шли 268 путей clk_mem, до −1,7 нс. Цена ступени: промах кэша оставляет в H
+    // точку, прочитавшую метки ДО догрузки строки. Её чтение повторяется (t_rpl — такт после записи
+    // метки, адрес — точки в H), иначе соседняя точка той же строки промахнулась бы ещё раз и
+    // загрузила строку во второй путь. Промах длиннее на такт.
     wire        tg_we;
     wire [6:0]  tg_wa;
     wire [23:0] tg_wd;
-    wire [23:0] pd_tw;
+    wire [23:0] h_tw;
     wire        td_we0, td_we1;
     wire [9:0]  td_wa;
-    wire [31:0] pd_w0, pd_w1;
+    wire [31:0] h_w0, h_w1;
+    reg         t_rpl;                                             // повторить чтение для точки в H
+    reg  [22:0] ph_ta;
+    wire [11:2] r_ta  = t_rpl ? ph_ta[11:2] : c_ta[11:2];
+    wire        r_re  = adv || t_rpl;
     bz_ram #(.AW(7), .DW(24)) u_tag (.clk(clk), .we(tg_we), .wa(tg_wa), .wd(tg_wd),
-                                     .re(adv), .ra(c_ta[11:5]), .rd(pd_tw));
+                                     .re(r_re), .ra(r_ta[11:5]), .rd(h_tw));
     bz_ram #(.AW(10), .DW(32)) u_td0 (.clk(clk), .we(td_we0), .wa(td_wa), .wd(m_rd_data),
-                                      .re(adv), .ra(c_ta[11:2]), .rd(pd_w0));
+                                      .re(r_re), .ra(r_ta[11:2]), .rd(h_w0));
     bz_ram #(.AW(10), .DW(32)) u_td1 (.clk(clk), .we(td_we1), .wa(td_wa), .wd(m_rd_data),
-                                      .re(adv), .ra(c_ta[11:2]), .rd(pd_w1));
+                                      .re(r_re), .ra(r_ta[11:2]), .rd(h_w1));
 
     // lightmap по колонке: r0 = L(iu, iv)·(16 − fu) + L(iu1, iv)·fu, r1 — то же в строке iv1
     wire [7:0]  c_l00 = pc_lb[{pc_pv0, pc_pu0}];
@@ -494,51 +507,87 @@ module bz_pix (
     wire [11:0] c_r1  = {4'd0, c_l01} * {7'd0, c_gu} + {4'd0, c_l11} * {8'd0, pc_fu};
 
     // =================================================================================================
-    // Ступень D — попадание в кэш текстур, строка света
+    // Ступень H — метки и слова кэша текстур с выхода BSRAM: попадание; строка света
+    // =================================================================================================
+    reg        ph_v, ph_e, ph_g;
+    reg [11:0] ph_r0, ph_r1;
+    reg [3:0]  ph_fv;
+    reg [17:0] ph_zch, ph_cch;
+    reg [3:0]  ph_zln;
+    reg [4:0]  ph_cln;
+    reg [15:0] ph_z16;
+    reg [5:0]  ph_vr;
+    always @(posedge clk)
+        if (rst)
+            ph_v <= 1'b0;
+        else if (adv) begin
+            ph_v   <= pc_v;
+            ph_e   <= pc_e;
+            ph_g   <= pc_g;
+            ph_ta  <= c_ta;
+            ph_r0  <= c_r0;
+            ph_r1  <= c_r1;
+            ph_fv  <= pc_fv;
+            ph_zch <= pc_zch;
+            ph_cch <= pc_cch;
+            ph_zln <= pc_zln;
+            ph_cln <= pc_cln;
+            ph_z16 <= pc_z16;
+            ph_vr  <= pc_vr;
+        end
+
+    wire [11:0] h_md   = bk_mode[ph_g];
+    wire [10:0] h_tg   = ph_ta[22:12];
+    wire        h_h0   = h_tw[11] && h_tw[10:0] == h_tg;
+    wire        h_h1   = h_tw[23] && h_tw[22:12] == h_tg;
+    // строка света: (r0·(16 − fv) + r1·fv) >> 10 — 0…63
+    wire [4:0]  h_gv   = 5'd16 - {1'b0, ph_fv};
+    wire [16:0] h_val  = {5'd0, ph_r0} * {12'd0, h_gv} + {5'd0, ph_r1} * {13'd0, ph_fv};
+    wire [5:0]  h_row  = (h_md[1:0] == 2'd0) ? h_val[15:10] : ph_vr;
+
+    // =================================================================================================
+    // Ступень D — промах кэша текстур: стоп и догрузка строки
     // =================================================================================================
     reg        pd_v, pd_e, pd_g;
     reg [22:0] pd_ta;
-    reg [11:0] pd_r0, pd_r1;
-    reg [3:0]  pd_fv;
+    reg [23:0] pd_tw;                          // метки набора (для выбора пути и записи новой)
+    reg        pd_h0, pd_h1;                   // попадание в путь 0 / 1
+    reg [31:0] pd_wd;                          // слово из попавшего пути
+    reg [5:0]  pd_row;
     reg [17:0] pd_zch, pd_cch;
     reg [3:0]  pd_zln;
     reg [4:0]  pd_cln;
     reg [15:0] pd_z16;
-    reg [5:0]  pd_vr;
     always @(posedge clk)
         if (rst)
             pd_v <= 1'b0;
         else if (adv) begin
-            pd_v   <= pc_v;
-            pd_e   <= pc_e;
-            pd_g   <= pc_g;
-            pd_ta  <= c_ta;
-            pd_r0  <= c_r0;
-            pd_r1  <= c_r1;
-            pd_fv  <= pc_fv;
-            pd_zch <= pc_zch;
-            pd_cch <= pc_cch;
-            pd_zln <= pc_zln;
-            pd_cln <= pc_cln;
-            pd_z16 <= pc_z16;
-            pd_vr  <= pc_vr;
+            pd_v   <= ph_v;
+            pd_e   <= ph_e;
+            pd_g   <= ph_g;
+            pd_ta  <= ph_ta;
+            pd_tw  <= h_tw;
+            pd_h0  <= h_h0;
+            pd_h1  <= h_h1;
+            pd_wd  <= h_h0 ? h_w0 : h_w1;
+            pd_row <= h_row;
+            pd_zch <= ph_zch;
+            pd_cch <= ph_cch;
+            pd_zln <= ph_zln;
+            pd_cln <= ph_cln;
+            pd_z16 <= ph_z16;
         end
 
     wire [11:0] d_md   = bk_mode[pd_g];
     wire        d_need = pd_v && !pd_e && !d_md[M_SOLID];          // точке нужен тексель
     wire [6:0]  d_set  = pd_ta[11:5];
     wire [10:0] d_tg   = pd_ta[22:12];
-    wire        d_h0   = pd_tw[11] && pd_tw[10:0] == d_tg;
-    wire        d_h1   = pd_tw[23] && pd_tw[22:12] == d_tg;
     reg         t_fwd;                                             // строка догружена: слово — из t_fw
     reg  [31:0] t_fw;
-    wire [31:0] d_word = t_fwd ? t_fw : d_h0 ? pd_w0 : pd_w1;
+    wire [31:0] d_word = t_fwd ? t_fw : pd_wd;
     wire [7:0]  d_tex  = 8'(d_word >> {pd_ta[1:0], 3'b000});
-    assign st_d = d_need && !d_h0 && !d_h1 && !t_fwd;
-    // строка света: (r0·(16 − fv) + r1·fv) >> 10 — 0…63
-    wire [4:0]  d_gv   = 5'd16 - {1'b0, pd_fv};
-    wire [16:0] d_val  = {5'd0, pd_r0} * {12'd0, d_gv} + {5'd0, pd_r1} * {13'd0, pd_fv};
-    wire [5:0]  d_row  = (d_md[1:0] == 2'd0) ? d_val[15:10] : pd_vr;
+    assign st_d = d_need && !pd_h0 && !pd_h1 && !t_fwd;
+    wire [5:0]  d_row  = pd_row;
 
     // промах — строка из SDRAM (8 слов) в вытесняемый путь; нужное слово — сразу точке (t_fwd)
     localparam [1:0] T_IDLE = 0, T_REQ = 1, T_DATA = 2, T_DONE = 3;
@@ -559,6 +608,7 @@ module bz_pix (
         if (rst) begin
             t_st   <= T_IDLE;
             t_fwd  <= 1'b0;
+            t_rpl  <= 1'b0;
             tx_req <= 1'b0;
             i_on   <= 1'b0;
         end else begin
@@ -584,19 +634,22 @@ module bz_pix (
                     t_n <= t_n + 1'b1;
                     if (t_n == 4'd7) begin
                         tc_lru[d_set] <= ~t_way;
-                        t_fwd <= 1'b1;
+                        t_rpl <= 1'b1;                 // метки записаны: точке в H — прочесть заново
                         t_st  <= T_DONE;
                     end
                 end
-            default:                                   // T_DONE: точка возьмёт слово и уйдёт
-                if (adv) begin
+            default:                                   // T_DONE: такт повтора чтения, потом точка возьмёт слово и уйдёт
+                if (t_rpl) begin
+                    t_rpl <= 1'b0;                     // st_d ещё 1 (t_fwd = 0): adv в этом такте нет
+                    t_fwd <= 1'b1;
+                end else if (adv) begin
                     t_fwd <= 1'b0;
                     t_st  <= T_IDLE;
                 end
             endcase
             // попадание: следующим вытеснять другой путь
-            if (adv && d_need && !t_fwd && (d_h0 || d_h1))
-                tc_lru[d_set] <= d_h0;
+            if (adv && d_need && !t_fwd && (pd_h0 || pd_h1))
+                tc_lru[d_set] <= pd_h0;
             // сброс кэша: 128 наборов по одному за такт
             if (inv) begin
                 i_on <= 1'b1;
@@ -999,7 +1052,7 @@ module bz_pix (
             endcase
     end
 
-    assign busy = pa_v || pb_v || pt_v || pc_v || pd_v || pe_v || pf_v || rel || z_fl || c_fl || zw_busy || cw_busy ||
+    assign busy = pa_v || pb_v || pt_v || pc_v || ph_v || pd_v || pe_v || pf_v || rel || z_fl || c_fl || zw_busy || cw_busy ||
                   zr_busy || cr_busy || t_st != T_IDLE || a_st != A_IDLE || i_on || l_st != L_IDLE;
     assign dbg = {zw_busy, cw_busy, a_st != A_IDLE, st_f, st_e, st_d, in_valid, pf_v && !pf_e};
 endmodule

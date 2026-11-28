@@ -38,6 +38,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdint.h>
 
 /* функции и данные id, которых нет в r_local.h */
 image_t *R_TextureAnimation (mtexinfo_t *tex);
@@ -94,7 +96,20 @@ static void layout (int w, int h)
 
 static cbuf_t  cb_main, cb_sky;     /* небо копится отдельно и идёт после непрозрачного мира */
 static uint32_t sky_frame_words;    /* наибольшее число слов неба за кадр — для замера (bz.csv sky_bytes) */
-static cbuf_t *cb = &cb_main;
+/* 28.11.2026: у каждой стороны (bz_int.h, bz_ectx) — свой текущий буфер: игра пишет в cb_main (и cb_sky), модели на
+ * ядре 0 — в cb_ent (куски, что вклеиваются в поток на месте моделей, — «МОДЕЛИ НА ЯДРЕ 0» ниже) */
+static cbuf_t  cb_ent;
+static cbuf_t *cb_ctx[2] = { &cb_main, &cb_ent };
+#define cb (cb_ctx[bz_ectx ()])
+#ifndef __XTENSA__
+#ifdef _MSC_VER
+__declspec(thread) int bz_ectx_pc;
+#else
+__thread int bz_ectx_pc;
+#endif
+#else
+volatile uint32_t bz_e_sp[2];      /* стек задачи LINK: {начало, длина} (bz_link.c), 0 — моделей на ней нет */
+#endif
 static int     need_setup = 1;      /* SETUP ещё не ушёл (ставит BZ_SetMode, снимает BZ_EndFrame) */
 
 /* определены в bz_hot.c (подключён ниже), а зовутся и раньше */
@@ -114,8 +129,58 @@ int bz_link_wait_idle (void);                                      /* дожда
  * до двух, третий заполняется; +32 КБ PSRAM. Не нашлось второго — работает с одним, как раньше. */
 #define CB_SPARES 2
 void bz_link_set_depth (int depth);   /* bz_link.c: сколько буферов может быть в отправке разом */
+/* bz_link.c: модели на ядре 0 (28.11.2026, «МОДЕЛИ НА ЯДРЕ 0» ниже) */
+int       bz_link_ent_ok (void);                           /* задача LINK есть — ей можно отдать модели */
+void      bz_link_ent_pool (uint32_t *pool, int chunks, uint32_t words);   /* куски моделей (NULL — нет) */
+void      bz_link_ent_post (void);                         /* игра: модели кадра — задаче */
+void      bz_link_ent_join (void);                         /* игра: здесь в потоке — модели; ждать их */
+uint32_t *bz_link_ent_chunk (uint32_t *full, uint32_t n);  /* задача: кусок полон — следующий */
+void      bz_link_ent_end (uint32_t *last, uint32_t n);    /* задача: модели кончились */
+void      bz_link_tick (void);                             /* задача, внутри моделей: отправить своё */
+#define ENT_WORDS  (1u << 12)       /* слов в куске моделей (16 КБ) */
+#define ENT_CHUNKS 3                /* кусков (48 КБ PSRAM): слов моделей за кадр на demo1 (ПК, bz.csv ent_bytes) — медиана 5,4 тыс., p99 9,8 тыс., больше всего 12,1 тыс. */
+/* 28.11.2026 (плата board_log43: прошивка 0.1.183 взяла на 32 КБ больше, куски моделей отдельным куском 48 КБ — и
+ * base2 не загрузилась: «Hunk: no memory for 65536 bytes», свободно 144 КБ кусками до 48 КБ): куски моделей — хвост
+ * cb_blk, за запасными ячейками. Нехватка кучи — одалживаются вместе с ними (до 112 КБ подряд, модели тем временем
+ * рисует игра); не хватает и так — хвост отдаётся первым (BZ_ReleaseSpare, ужать на месте), запасные остаются. */
+static uint32_t *ent_pool;          /* cb_blk + CB_SLOTS × CB_ESP_WORDS (NULL — кусков нет) */
+static int       ent_posted;        /* ниже, «МОДЕЛИ НА ЯДРЕ 0» */
+static int       cb_lend_ent;       /* одалживание началось с хвостом моделей (задача без кусков до возврата) */
 static uint32_t *cb_spare[CB_SPARES]; /* запасные: [0] ушёл раньше всех — его отправка уже кончилась */
 static int       cb_nspare, cb_spare_failed;
+/* 27.11.2026: буфер кадра и запасные — один кусок PSRAM (cb_blk, 3 × 32 КБ), а не три. Две ячейки подряд — 64 КБ
+ * одним куском: когда куче не хватает места (раздроблена к третьей смене карты, плата board_log35), этот кусок
+ * на время ОДАЛЖИВАЕТСЯ под загрузку (BZ_Borrow: точки картинки неба — 64 КБ), отправка тем временем идёт без
+ * очереди (cb_nspare = 0), а когда всё одолженное вернули — запасные снова в круге. Раньше запасные отдавались
+ * куче навсегда (BZ_ReleaseSpare), и до конца игры кадр ждал LINK: 20 fps вместо 28. */
+#define CB_SLOTS (1 + CB_SPARES)
+#define CB_LEND_MAX 8
+static uint32_t *cb_blk;            /* NULL — буферы по отдельности (кусок не нашёлся), одалживать нечего */
+static uint32_t  cb_lend_off;       /* байт одолжено подряд от начала ячейки 1 */
+static int       cb_lent;           /* одолжено кусков (0 — запасные в круге) */
+static struct { uint8_t *p; uint32_t n; } cb_lend[CB_LEND_MAX];
+static int       cb_in_setup;       /* идёт cb_setup_first: буфер кадра — временный, кусок не одалживать */
+
+static int cb_in_blk (const void *p)
+{
+	return cb_blk && (const uint8_t *)p >= (const uint8_t *)cb_blk &&
+	       (const uint8_t *)p < (const uint8_t *)(cb_blk + CB_SLOTS * CB_ESP_WORDS);
+}
+
+/* Все отправки кончились: буфер кадра — в ячейку 0 (с накопленным), запасные — ячейки 1, 2. */
+static void cb_blk_home (void)
+{
+	int i;
+
+	bz_link_wait_idle ();
+	if (cb_main.w != cb_blk)
+	{
+		memcpy (cb_blk, cb_main.w, cb_main.n * sizeof(uint32_t));
+		cb_main.w = cb_blk;
+	}
+	for (i = 0; i < CB_SPARES; i++)
+		cb_spare[i] = cb_blk + (1 + i) * CB_ESP_WORDS;
+}
 
 /* Отдать накопленное задаче LINK и писать дальше в самый давний запасной буфер: в отправке — не больше
  * cb_nspare последних (bz_link_send_async ждёт, пока их станет меньше), а он отдан раньше них. */
@@ -126,7 +191,7 @@ static void cb_main_ship (void)
 
 	if (!cb_main.n)
 		return;
-	while (cb_nspare < CB_SPARES && !cb_spare_failed)
+	while (!cb_blk && cb_nspare < CB_SPARES && !cb_spare_failed)
 	{
 		if ((cb_spare[cb_nspare] = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
 		{
@@ -163,19 +228,48 @@ static void cb_main_ship (void)
  * 2272 → 2176 КБ, base2 не поместилась). Здесь они — из запаса кучи, как и раньше. */
 void BZ_AllocCmdBuffers (void)
 {
-	if (!cb_main.w)
-	{
-		cb_main.cap = CB_ESP_WORDS;
-		if ((cb_main.w = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
-			ri.Sys_Error (ERR_FATAL, "bz: out of memory");
-	}
 	if (!cb_sky.w)
 	{
 		cb_sky.cap = 1024u;
 		if ((cb_sky.w = malloc (cb_sky.cap * sizeof(uint32_t))) == NULL)
 			ri.Sys_Error (ERR_FATAL, "bz: out of memory");
 	}
-	while (cb_nspare < CB_SPARES && !cb_spare_failed)
+	if (!cb_blk && !cb_nspare && (!cb_main.w || cb_main.cap == CB_ESP_WORDS))
+	{
+		/* одним куском (выше): буфер кадра — ячейка 0, накопленное в нём (если он уже был) — туда же; за запасными —
+		 * куски моделей (нет места на них — без них) */
+		uint32_t *b = malloc ((CB_SLOTS * CB_ESP_WORDS + ENT_CHUNKS * ENT_WORDS) * sizeof(uint32_t));
+		int       with_ent = b != NULL;
+
+		if (!b)
+			b = malloc (CB_SLOTS * CB_ESP_WORDS * sizeof(uint32_t));
+		if (b)
+		{
+			if (cb_main.w)
+			{
+				bz_link_wait_idle ();
+				memcpy (b, cb_main.w, cb_main.n * sizeof(uint32_t));
+				free (cb_main.w);
+			}
+			cb_blk = b;
+			cb_main.w = b;
+			cb_main.cap = CB_ESP_WORDS;
+			cb_nspare = CB_SPARES;
+			cb_blk_home ();
+			if (with_ent)
+			{
+				ent_pool = b + CB_SLOTS * CB_ESP_WORDS;
+				bz_link_ent_pool (ent_pool, ENT_CHUNKS, ENT_WORDS);
+			}
+		}
+	}
+	if (!cb_main.w)
+	{
+		cb_main.cap = CB_ESP_WORDS;
+		if ((cb_main.w = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
+			ri.Sys_Error (ERR_FATAL, "bz: out of memory");
+	}
+	while (!cb_blk && cb_nspare < CB_SPARES && !cb_spare_failed)
 	{
 		if ((cb_spare[cb_nspare] = malloc (cb_main.cap * sizeof(uint32_t))) == NULL)
 			cb_spare_failed = 1;
@@ -185,12 +279,131 @@ void BZ_AllocCmdBuffers (void)
 	bz_link_set_depth (cb_nspare);
 }
 
-/* Памяти нет (q2_malloc, esp/main/compat.c — после сброса моделей прошлой карты): отдать один запасной буфер
- * кадра (32 КБ). Сначала — дождаться конца отправок: запасной мог
- * ещё уходить в ядро. Больше их не брать (до BZ_Shutdown): взятый заново посреди карты снова дробил бы кучу.
- * 1 — отдан, 0 — отдавать нечего. */
+/* Памяти нет (q2_malloc, esp/main/compat.c — после сброса моделей прошлой карты): одолжить кусок n байт из
+ * запасных ячеек (выше, cb_blk). Одолженное лежит подряд; вернуть — BZ_Unborrow. NULL — не влезает или
+ * буферы не одним куском. */
+void *BZ_Borrow (uint32_t n)
+{
+	uint8_t *p;
+
+	uint32_t cap;
+
+	n = (n + 15u) & ~15u;
+	/* с хвостом моделей (если он есть и модели сейчас не считаются: их куски — там) */
+	cap = CB_SPARES * CB_ESP_WORDS * (uint32_t)sizeof(uint32_t);
+	if (ent_pool && (cb_lent ? cb_lend_ent : !ent_posted))
+		cap += ENT_CHUNKS * ENT_WORDS * (uint32_t)sizeof(uint32_t);
+	if (!cb_blk || cb_in_setup || cb_lent >= CB_LEND_MAX || cb_lend_off + n > cap)
+		return NULL;
+	if (!cb_lent)
+	{
+		cb_blk_home ();             /* отправки кончились (и куски моделей), ячейки 1, 2 свободны */
+		cb_lend_ent = ent_pool && !ent_posted;
+		if (cb_lend_ent)
+			bz_link_ent_pool (NULL, 0, 0);   /* пока одолжено — модели рисует игра */
+		cb_nspare = 0;              /* пока одолжено — отправка без очереди (cb_main_ship) */
+		bz_link_set_depth (0);
+		cb_lend_off = 0;
+	}
+	p = (uint8_t *)(cb_blk + CB_ESP_WORDS) + cb_lend_off;
+	cb_lend[cb_lent].p = p;
+	cb_lend[cb_lent].n = n;
+	cb_lent++;
+	cb_lend_off += n;
+	return p;
+}
+
+/* p одолжен BZ_Borrow — сколько байт (0 — не одолжен). */
+uint32_t BZ_BorrowedSize (const void *p)
+{
+	int i;
+
+	for (i = 0; i < cb_lent; i++)
+		if (cb_lend[i].p == p)
+			return cb_lend[i].n;
+	return 0;
+}
+
+/* p одолжен BZ_Borrow — вернуть (1); иначе 0. Вернули всё — запасные снова в круге. */
+int BZ_Unborrow (void *p)
+{
+	int i;
+
+	for (i = 0; i < cb_lent; i++)
+		if (cb_lend[i].p == p)
+			break;
+	if (i == cb_lent)
+		return 0;
+	cb_lend[i] = cb_lend[--cb_lent];
+	if (!cb_lent)
+	{
+		cb_lend_off = 0;
+		cb_nspare = CB_SPARES;
+		cb_blk_home ();
+		bz_link_set_depth (cb_nspare);
+		if (cb_lend_ent)
+			bz_link_ent_pool (ent_pool, ENT_CHUNKS, ENT_WORDS);
+		cb_lend_ent = 0;
+	}
+	return 1;
+}
+
+/* Отдать куче хвост моделей (куски на ядре 0) насовсем: модели дальше рисует игра. Не сейчас (одолжено, модели
+ * считаются) — 0. Зовут: BZ_ReleaseSpare, проверка памяти после карты (sys_esp.c, q2_map_report). */
+int BZ_EntRelease (void)
+{
+	uint32_t *b;
+
+	if (!ent_pool || !cb_blk || cb_lent || ent_posted)
+		return 0;
+	cb_blk_home ();                 /* куски моделей ушли (bz_link_wait_idle) */
+	bz_link_ent_pool (NULL, 0, 0);
+	ent_pool = NULL;
+	b = realloc (cb_blk, CB_SLOTS * CB_ESP_WORDS * sizeof(uint32_t));   /* ужать на месте: хвост — в конце */
+	if (b && b != cb_blk)
+	{
+		/* realloc переложил (не должен при ужатии) — ячейки на новом месте */
+		cb_blk = b;
+		cb_main.w = b;
+		cb_blk_home ();
+	}
+	ri.Con_Printf (PRINT_DEVELOPER, "bz: model chunks given back to the heap\n");
+	return 1;
+}
+
+/* Памяти нет и одолжить нельзя: отдать запасные куче насовсем. Буферы по отдельности — один запасной (32 КБ)
+ * за вызов; одним куском — хвост куска (ячейки 1, 2: 64 КБ подряд), буфер кадра остаётся в ячейке 0.
+ * Сначала — дождаться конца отправок. Больше их не брать (до BZ_Shutdown): взятые заново посреди карты снова
+ * дробили бы кучу. 1 — отдано, 0 — отдавать нечего (или кусок сейчас одолжен). */
 int BZ_ReleaseSpare (void)
 {
+	/* 28.11.2026: сначала — хвост моделей (BZ_EntRelease), запасные остаются */
+	if (BZ_EntRelease ())
+		return 1;
+	if (cb_blk)
+	{
+		uint32_t *b;
+
+		if (cb_lent || ent_posted)
+			return 0;
+		if (ent_pool)
+		{
+			bz_link_ent_pool (NULL, 0, 0);
+			ent_pool = NULL;
+		}
+		cb_blk_home ();
+		b = cb_blk;
+		/* сначала — «кусок отдан»: realloc ниже (q2_realloc) при неудаче сам зовёт BZ_ReleaseSpare */
+		cb_blk = NULL;
+		cb_nspare = 0;
+		cb_spare_failed = 1;
+		cb_spare[0] = cb_spare[1] = NULL;
+		bz_link_set_depth (0);
+		b = realloc (b, CB_ESP_WORDS * sizeof(uint32_t));   /* ужать на месте: ячейка 0 — в начале */
+		if (b)
+			cb_main.w = b;
+		return 1;
+	}
 	if (!cb_nspare)
 		return 0;
 	bz_link_wait_idle ();
@@ -213,6 +426,7 @@ static void cb_setup_first (void)
 		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
 	old = cb_main;
 	memset (&cb_main, 0, sizeof(cb_main));
+	cb_in_setup = 1;
 	need_setup = 0;                 /* до emit_setup: его слова уходят частями тем же путём */
 	emit_setup ();
 	/* остаток SETUP — тем же путём, что и его начало (половина могла уже уйти задаче LINK), и только когда
@@ -220,7 +434,35 @@ static void cb_setup_first (void)
 	cb_main_ship ();
 	if (bz_link_wait_idle () != 0 || bz_link_send (old.w, old.n) != 0)
 		ri.Sys_Error (ERR_FATAL, "LINK to the Q2 core failed");
-	free (old.w);
+	if (cb_in_blk (old.w))
+	{
+		/* 27.11.2026: старый буфер — ячейка куска (cb_blk), его в круге больше нет; вместо него в круге — новый,
+		 * отдельный, взятый под SETUP (put). Его — куче, ячейку — обратно в круг (с накопленным, если он — буфер
+		 * кадра). */
+		uint32_t *f = NULL;
+		int       i;
+
+		bz_link_wait_idle ();
+		if (!cb_in_blk (cb_main.w))
+		{
+			f = cb_main.w;
+			memcpy (old.w, f, cb_main.n * sizeof(uint32_t));
+			cb_main.w = old.w;
+		}
+		else
+			for (i = 0; i < cb_nspare; i++)
+				if (!cb_in_blk (cb_spare[i]))
+				{
+					f = cb_spare[i];
+					cb_spare[i] = old.w;
+				}
+		free (f);
+		if (!cb_lent)
+			cb_blk_home ();
+	}
+	else
+		free (old.w);
+	cb_in_setup = 0;
 }
 #endif
 
@@ -232,6 +474,14 @@ static void put_full (uint32_t v)
 	 * Порядок слов тот же; помнить TEX/LMAP можно и дальше — ядро их уже получило. SETUP должен идти
 	 * раньше всех команд: если он ещё не ушёл (первый кадр не нарисован — Quake 2 сразу грузит уровень
 	 * демо, Unreal NG 24.11), он уходит первым, как в BZ_EndFrame, а за ним — накопленное. */
+	/* 28.11.2026: модели на ядре 0 — полный кусок задаче LINK (уйдёт на месте моделей), писать дальше в свободный */
+	if (cb == &cb_ent && cb_ent.n == cb_ent.cap && cb_ent.cap)
+	{
+		cb_ent.w = bz_link_ent_chunk (cb_ent.w, cb_ent.n);
+		cb_ent.n = 0;
+		cb_ent.w[cb_ent.n++] = v;
+		return;
+	}
 	if (cb == &cb_main && cb->n == cb->cap && cb->cap)
 	{
 		if (need_setup)
@@ -258,7 +508,8 @@ static void put_full (uint32_t v)
 
 /* ---------------------------------------------------------------- счётчики переднего края */
 
-static bz_fstat_t fs;              /* тип — bz_int.h */
+static bz_fstat_t fs_ctx[2];       /* тип — bz_int.h; по стороне (bz_ectx), в конце кадра — вместе */
+#define fs (fs_ctx[bz_ectx ()])
 
 #ifndef BZ_ESP
 static void store_trap (uint32_t addr, uint32_t bytes, const uint64_t *counter);   /* ниже, хранилище */
@@ -285,6 +536,56 @@ static void emit_write (uint32_t addr, const byte *data, uint32_t bytes, uint64_
 }
 
 /* ---------------------------------------------------------------- текстуры в SDRAM */
+
+/* Текстура — WRITE прямо в поток команд, тексель за текселем (27.11.2026). Раньше она сначала собиралась в
+ * буфер w2·h2 байт (до 64 КБ у неба) и уже из него копировалась в поток: при загрузке карты это второй
+ * кусок PSRAM в 64 КБ рядом с точками картинки (тоже 64 КБ), а куча к третьей смене карты дробится — плата
+ * board_log35, waste2 → base2: «malloc: no memory for 65536 bytes», свободно 160 КБ кусками до 48 КБ.
+ * Слова те же: байт a слова — тексель a раскладки (плитки 8×8 или строки), он — ближайший в исходнике.
+ * pix = NULL — нули. lin — строками ширины w (w2 = w, h2 = h). */
+static void emit_tex (const texent_t *e, const byte *pix, int w, int h, uint64_t *counter)
+{
+	uint32_t bytes = (uint32_t)(e->w2 * e->h2), words = (bytes + 3) / 4, i, b;
+	uint32_t bw = (uint32_t)e->w2 >> 3;
+	int      tiles = !e->lin && e->w2 >= 8 && e->h2 >= 8;
+
+#ifndef BZ_ESP
+	store_trap (e->addr, 4u * words, counter);
+#endif
+	put (((uint32_t)BZ_WRITE << 24) | words);
+	put (e->addr);
+	for (i = 0; i < words; i++)
+	{
+		uint32_t v = 0;
+		if (pix)
+			for (b = 0; b < 4; b++)
+			{
+				uint32_t a = i * 4 + b, x, y;
+				if (a >= bytes)
+					break;
+				if (e->lin)
+				{
+					v |= (uint32_t)pix[a] << (8 * b);
+					continue;
+				}
+				if (tiles)          /* a = ((y/8)·(w2/8) + x/8)·64 + (y%8)·8 + x%8 */
+				{
+					uint32_t t = a >> 6;
+					y = ((t / bw) << 3) | ((a >> 3) & 7);
+					x = ((t % bw) << 3) | (a & 7);
+				}
+				else
+				{
+					y = a / (uint32_t)e->w2;
+					x = a % (uint32_t)e->w2;
+				}
+				/* ближайший тексель исходника; при степени двойки — он сам */
+				v |= (uint32_t)pix[(y * (uint32_t)h / (uint32_t)e->h2) * (uint32_t)w + x * (uint32_t)w / (uint32_t)e->w2] << (8 * b);
+			}
+		put (v);
+	}
+	*counter += 4u * words;
+}
 
 /* Ближайшая степень двойки (в логарифме): 96 → 128, 320 → 256, 80 → 64. */
 static int pow2_near (int v)
@@ -337,6 +638,10 @@ static uint32_t name_fnv (const char *s)
 }
 
 image_t *bz_alias_skin;            /* r_alias.c (p04): шкурка модели, что рисуется              */
+/* Самый левый x вершины, которую можно слать за краем окна (bz_hot.c: face_guard, ab_in_guard; 27.11.2026).
+ * Ядро 0.03 теряло отрезки левее окна (беззнаковое сравнение с ножницами в bz_raster.sv; с ним было бы нужно 0),
+ * ядро 0.04 и модель C — нет. Q2.ELF идёт только с ядром 0.04+ (пакет — одна копия игры, слово пользователя). */
+int bz_guard_left = -1999;
 image_t *bz_poly_image;            /* r_sprite.c (p04): картинка спрайта для BZ_DrawPoly        */
 static int image_serial;           /* последний выданный номер картинки                         */
 
@@ -473,9 +778,9 @@ static texent_t *tex_load_body (image_t *img, int mip, int w, int h, int lin)
 	uint32_t  hsh = ((uint32_t)id * 2654435761u + (unsigned)(mip * 2 + lin)) & (TEXHASH - 1);
 	uint32_t  nh = img->bz_name_hash;
 	texent_t *e;
-	byte     *buf, *temp = NULL;
+	byte     *temp = NULL;
 	const byte *pix;
-	uint32_t  size, x, y;
+	uint32_t  size;
 
 	for (;; hsh = (hsh + 1) & (TEXHASH - 1))
 	{
@@ -529,28 +834,8 @@ static texent_t *tex_load_body (image_t *img, int mip, int w, int h, int lin)
 	pix = img->pixels[mip];
 	if (!pix)
 		pix = temp = R_EspReloadPixels (img, mip);   /* точки отданы ядру: заново из файла */
-	buf = malloc (size);
-	if (!pix)
-	{
-		/* файла нет или он другой — текстура будет чёрной, но память ядра не мусор */
+	if (!pix)   /* файла нет или он другой — текстура будет чёрной, но память ядра не мусор */
 		ri.Con_Printf (PRINT_ALL, "bz: %s: no pixels to load\n", img->name);
-		memset (buf, 0, size);
-	}
-	else if (lin)
-		memcpy (buf, pix, w * h);
-	else
-		for (y = 0; y < (uint32_t)e->h2; y++)
-			for (x = 0; x < (uint32_t)e->w2; x++)
-			{
-				/* ближайший тексель исходника; при степени двойки — он сам */
-				byte c = pix[(y * h / e->h2) * w + x * w / e->w2];
-				uint32_t a;
-				if (e->w2 >= 8 && e->h2 >= 8)
-					a = (((y >> 3) * (e->w2 >> 3) + (x >> 3)) << 6) + ((y & 7) << 3) + (x & 7);
-				else
-					a = y * e->w2 + x;
-				buf[a] = c;
-			}
 	{
 		/* загрузка — в основной поток кадра, даже для грани неба (25.11.2026, плата: текстура неба до 64 КБ
 		 * ложилась в буфер неба, тот рос вдвое — «realloc: no memory for 65536 bytes» посреди игры). Небо
@@ -558,10 +843,9 @@ static texent_t *tex_load_body (image_t *img, int mip, int w, int h, int lin)
 		cbuf_t *keep = cb;
 
 		cb = &cb_main;
-		emit_write (e->addr, buf, (uint32_t)(e->w2 * e->h2), &fs.tex_bytes);
+		emit_tex (e, pix, w, h, &fs.tex_bytes);
 		cb = keep;
 	}
-	free (buf);
 	if (temp)
 		free (temp);
 	fs.tex_uploads++;
@@ -825,6 +1109,15 @@ void BZ_StoreWrite (uint32_t addr, const void *data, uint32_t bytes)
 }
 
 /* После загрузки: MARK — ядро скажет, когда всё записанное уже в SDRAM. */
+#ifdef BZ_ESP
+/* 28.11.2026: модели на ядре 0 читают кадры md2 сами (store_read без store_settle) — им нужно, чтобы ядро прошло MARK
+ * после записи кадров (BZ_StoreMarkModel), а не после каждой записи звука: ждать тот (store_settle — отправить всё и
+ * ждать ядро) на каждом кадре дорого, звук пишет в хранилище по ходу игры. */
+static uint32_t store_md2_mark;    /* номер MARK после последних кадров md2 */
+static int      store_md2_seen;    /* ядро его прошло (BZ_EntBegin) */
+int bz_link_mark_reached (uint32_t mark);
+#endif
+
 void BZ_StoreMark (void)
 {
 	cbuf_t *save = cb;
@@ -837,6 +1130,16 @@ void BZ_StoreMark (void)
 	store_unsent = 1;
 	store_dirty = 0;
 	store_mark_seen = 0;
+#endif
+}
+
+/* MARK после кадров md2 модели (r_model.c, p06) */
+void BZ_StoreMarkModel (void)
+{
+	BZ_StoreMark ();
+#ifdef BZ_ESP
+	store_md2_mark = store_mark;
+	store_md2_seen = 0;
 #endif
 }
 
@@ -855,15 +1158,10 @@ static void cb_send_now (void)
 }
 #endif
 
-/* Прочитать bytes байт хранилища (адрес кратен 4). */
-static void store_read (uint32_t addr, void *dst, uint32_t bytes)
-{
 #ifdef BZ_ESP
-	/* 26.11.2026: ядро уже подтвердило последний MARK, и записей в хранилище с тех пор не было — читать сразу,
-	 * не дожидаясь, пока задача LINK отправит отданную половину буфера кадра (плата, board_log13: игра ждала
-	 * LINK ~11 мс за кадр — в основном здесь, на каждом кадре md2 и куске звука). Чтение SDRAM (RD_ADDR,
-	 * RD_LEN, STATUS, окно) и отправка задачи (FIFO_FREE, FIFO) — разные регистры ядра; каждый вызов LINK
-	 * прошивка делает под своим замком. */
+/* Ядро выполнило все записи хранилища (MARK) — его можно читать (store_read; моделям на ядре 0 — BZ_EntBegin). */
+static void store_settle (void)
+{
 	if (!store_mark_seen)
 	{
 		if (store_unsent)           /* записи хранилища ещё в буфере кадра — отправить, иначе MARK не придёт */
@@ -877,6 +1175,22 @@ static void store_read (uint32_t addr, void *dst, uint32_t bytes)
 			ri.Sys_Error (ERR_FATAL, "LINK: SDRAM read of the Q2 core failed");
 		store_mark_seen = !store_dirty;
 	}
+}
+#endif
+
+/* Прочитать bytes байт хранилища (адрес кратен 4). */
+static void store_read (uint32_t addr, void *dst, uint32_t bytes)
+{
+#ifdef BZ_ESP
+	/* 26.11.2026: ядро уже подтвердило последний MARK, и записей в хранилище с тех пор не было — читать сразу,
+	 * не дожидаясь, пока задача LINK отправит отданную половину буфера кадра (плата, board_log13: игра ждала
+	 * LINK ~11 мс за кадр — в основном здесь, на каждом кадре md2 и куске звука). Чтение SDRAM (RD_ADDR,
+	 * RD_LEN, STATUS, окно) и отправка задачи (FIFO_FREE, FIFO) — разные регистры ядра; каждый вызов LINK
+	 * прошивка делает под своим замком. */
+	/* 28.11.2026: модели на ядре 0 (сторона 1) отправлять и ждать MARK не могут — это работа игры; BZ_EntBegin отдаёт
+	 * им кадр, только когда записи хранилища уже выполнены (store_mark_seen) */
+	if (!bz_ectx ())
+		store_settle ();
 	if (bz_link_read (addr, dst, bytes) != 0)
 		ri.Sys_Error (ERR_FATAL, "LINK: SDRAM read of the Q2 core failed");
 #else
@@ -1104,6 +1418,15 @@ static lment_t *lm_build (msurface_t *surf, bzr fx, bzr fy)
 
 static bz_ab_t ab;                 /* пачка треугольников модели (тип — bz_int.h; как рисует md2 — ниже) */
 
+/* модели на ядре 0 (ниже, «МОДЕЛИ НА ЯДРЕ 0»): их текстуры — из таблицы кадра; дать задаче LINK отправить своё */
+static texent_t *ent_tex (image_t *img, int mip, int w, int h, int lin);
+static void      ent_tick (void);
+#ifdef BZ_ONLY
+extern entity_t *e_currententity;   /* r_ent.c (p06): копия currententity у моделей (bz_ent.h) */
+#else
+#define e_currententity currententity   /* ref_bz: моделей на другом ядре нет */
+#endif
+
 /* Горячие функции — в bz_hot.c: тот же исходник собирается и в горячий модуль Q2HOT.ELF (esp/hot/q2hot.c),
  * который прошивка кладёт во внутреннее ОЗУ. Здесь он подключён как есть — свои копии функций. */
 #include "bz_hot.c"
@@ -1144,15 +1467,16 @@ void BZ_HotTables (void **imp, void **exp)
 	t->size = sizeof(*t);
 	t->abi = Q2HOT_ABI;
 	memcpy (t->sizes, sizes, sizeof(sizes));
-	t->cb = &cb;
+	t->cb_ctx = cb_ctx;
 	t->cb_sky = &cb_sky;
-	t->fs = &fs;
+	t->fs_ctx = fs_ctx;
 	t->mapa = &mapa;
 	t->ab = &ab;
 	t->texhash = texhash;
 	t->tex_page_frame = tex_page_frame;
 	t->tex_frame = &tex_frame;
 	t->bz_alias_skin = &bz_alias_skin;
+	t->bz_guard_left = &bz_guard_left;
 	t->put_full = put_full;
 	t->tex_load = tex_load;
 	t->image_id = image_id;
@@ -1163,6 +1487,11 @@ void BZ_HotTables (void **imp, void **exp)
 	t->r_newrefdef = &r_newrefdef;
 	t->r_framecount = &r_framecount;
 	t->BZ_CalcGradients = BZ_CalcGradients;
+	t->ent_tex = ent_tex;
+	t->ent_tick = ent_tick;
+#ifdef __XTENSA__
+	t->e_sp = bz_e_sp;
+#endif
 	t->currentmodel = &currentmodel;
 	t->r_pcurrentvertbase = &r_pcurrentvertbase;
 	t->view_clipplanes = view_clipplanes;
@@ -1189,7 +1518,7 @@ void BZ_HotTables (void **imp, void **exp)
 	t->tadjust = &tadjust;
 	t->r_aliasblendcolor = &r_aliasblendcolor;
 	t->r_affinetridesc = &r_affinetridesc;
-	t->currententity = &currententity;
+	t->ecur = &e_currententity;
 #ifdef BZ_ONLY
 	t->r_lerp_frontv = r_lerp_frontv;
 	t->r_lerp_backv = r_lerp_backv;
@@ -1476,6 +1805,359 @@ void BZ_DrawPoly (int iswater, int blendcolor)
 	emit_poly (xy, n, mode, (const uint32_t (*)[3])g, 3);
 }
 
+/* ---------------------------------------------------------------- модели на ядре 0 */
+
+/*
+ * МОДЕЛИ НА ЯДРЕ 0 (28.11.2026; «нужно хотя бы 30 fps», пользователь: «Модели на втором ядре»)
+ *   На плате тяжёлый кадр упирается в ядро ESP 1: мир ~13 мс и модели ~12 мс идут друг за другом (board_log41–42),
+ *   а ядро 0 почти всё это время крутит задачу LINK вхолостую — очередь ядра Tang полна, 12–19 мс за кадр.
+ *   Теперь непрозрачные модели и спрайты кадра (первый проход R_DrawEntitiesOnList id) считает задача LINK на ядре
+ *   ESP 0, пока игра на ядре 1 обходит мир, — в паузах своей отправки и между ними (bz_link.c, ent_tick).
+ *
+ *   ПОТОК КОМАНД ТОТ ЖЕ. Модели пишут в свои куски (cb_ent, ENT_CHUNKS по ENT_WORDS), а игра, дойдя до места
+ *   моделей (BZ_EntJoin — после мира и неба), ставит в очередь LINK метку: задача шлёт куски моделей ровно там, как
+ *   небо из cb_sky. Ядро Tang получает те же команды в том же порядке, что раньше (равные z, прозрачность — как
+ *   были); разница — только загрузки шкурок, которых ещё нет в SDRAM: они уходят раньше мира (ниже). Прозрачные
+ *   модели (второй проход id) рисует игра после метки, как раньше.
+ *
+ *   ЧТО У МОДЕЛЕЙ СВОЁ (сторона 1, bz_ectx):
+ *     - буфер команд (cb_ctx) и счётчики (fs_ctx);
+ *     - переменные id, которые мир меняет по ходу: currententity, currentmodel, modelorg, r_entorigin — и vpn,
+ *       vright, vup, view_clipplanes (их поворачивают двери и лифты, R_RotateBmodel). Файлы моделей id (r_alias.c,
+ *       r_sprite.c, r_poly.c, r_light.c, r_ent.c) начинаются с bz_ent.h — у них это e_currententity и т. д. (p06);
+ *       копии вида — здесь, в BZ_EntBegin;
+ *     - текстуры: общую таблицу (tex_get) моделям трогать нельзя — мир в это время грузит и вытесняет свои. Игра
+ *       заранее (BZ_EntBegin) грузит шкурки и картинки спрайтов кадра, их страницам ставит «следующий кадр» (до
+ *       конца кадра их не вытеснят — как страницам неба) и кладёт записи в таблицу кадра (ent_tex);
+ *     - вершины в экране (ent_fv): у id — 80 КБ на стеке R_AliasPreparePoints, у задачи LINK столько стека нет;
+ *     - сообщения id (e_ri.Con_Printf — консоль общая): копятся, печатает игра (BZ_EntJoin).
+ *   Кадры md2 модели читают из SDRAM ядра сами — это делает та же задача LINK, что шлёт, так что чтение и
+ *   отправка не мешают друг другу; записи хранилища к этому времени выполнены (store_settle в BZ_EntBegin).
+ *
+ *   ПК (q2esp.exe): bz_ent 1 — модели считаются заранее (в BZ_EntBegin, до мира, стороной 1): видно, что им
+ *   хватает своего (копий вида, таблицы кадра); bz_ent 2 — своим потоком параллельно с миром: видны гонки. Кадры
+ *   (mcrc в bz.csv) должны совпасть с bz_ent 0 — прежним путём, когда модели рисует игра на своём месте.
+ */
+#define ENT_TEX_MAX 64
+static struct { image_t *img; texent_t e; } ent_texs[ENT_TEX_MAX];
+static int          ent_ntex;
+static unsigned     ent_tex_miss;      /* модели спросили текстуру не из таблицы кадра (за всё время) */
+static texent_t     ent_tex_black;     /* замена такой: «текстура» 1×1 цвета 0 */
+static int          ent_posted;        /* модели кадра отданы стороне 1 (BZ_EntBegin) и ещё не забраны (BZ_EntJoin) */
+static finalvert_t *ent_fv, *ent_fv_raw; /* вершины модели в экране (выровнены на CACHE_SIZE) */
+static int          ent_fv_cap;
+static char         ent_msg[256];      /* первое сообщение id стороны 1 за кадр */
+static int          ent_nmsg;
+static cvar_t      *bz_ent_cv;
+static uint32_t     ent_words_max;     /* замер: больше всего слов моделей за кадр (куски cb_ent) */
+static uint64_t     ent_words_sum, ent_frames;
+uint32_t            bz_ent_skip[4];    /* модели кадра не отданы стороне 1: нет моделей / нет задачи или кусков / нет места вершинам / md2 (bz_link_report) */
+static uint32_t     ent_frame_words;   /* слов моделей в этом кадре (ПК: столбец ent_bytes в bz.csv) */
+#ifdef BZ_ONLY
+extern model_t     *e_currentmodel;    /* r_ent.c (p06): копии переменных id у моделей (bz_ent.h) */
+extern vec3_t       e_vpn, e_vright, e_vup;
+extern clipplane_t  e_view_clipplanes[4];
+extern refimport_t  e_ri;
+void E_DrawEntities (int translucent);
+#endif
+
+/* Текстура модели (сторона 1): из таблицы кадра. */
+static texent_t *ent_tex (image_t *img, int mip, int w, int h, int lin)
+{
+	int i;
+
+	for (i = 0; i < ent_ntex; i++)
+		if (ent_texs[i].img == img && ent_texs[i].e.w == w && ent_texs[i].e.h == h && ent_texs[i].e.mip == mip &&
+		    ent_texs[i].e.lin == lin)
+			return &ent_texs[i].e;
+	ent_tex_miss++;
+	ent_tex_black.lin = 1;
+	ent_tex_black.w = ent_tex_black.h = ent_tex_black.w2 = ent_tex_black.h2 = 1;
+	ent_tex_black.addr = mapa.solid;
+	return &ent_tex_black;
+}
+
+/* Игра: текстура (строками, mip 0) для моделей — загрузить, в таблицу кадра, страницу не вытеснять до конца кадра. */
+static void ent_tex_add (image_t *img, int w, int h)
+{
+	texent_t *e;
+	int       i, p;
+
+	if (!img)
+		return;
+	for (i = 0; i < ent_ntex; i++)
+		if (ent_texs[i].img == img && ent_texs[i].e.w == w && ent_texs[i].e.h == h)
+			return;
+	if (ent_ntex == ENT_TEX_MAX)
+		return;                     /* не влезла — у модели будет чёрная (ent_tex_miss) */
+	e = tex_get (img, 0, w, h, 1);
+	p = (int)((e->addr - mapa.tex) / TEX_PAGE);
+	if (tex_page_frame[p] < tex_frame + 1)
+		tex_page_frame[p] = tex_frame + 1;
+	ent_texs[ent_ntex].img = img;
+	ent_texs[ent_ntex].e = *e;
+	ent_ntex++;
+}
+
+/* Сторона 1, внутри моделей: дать задаче LINK отправить своё (bz_link.c решает, пора ли). */
+static void ent_tick (void)
+{
+#ifdef BZ_ESP
+	if (bz_ectx ())
+		bz_link_tick ();
+#endif
+}
+
+void BZ_EntTick (void)
+{
+	ent_tick ();
+}
+
+/* Вершины модели в экране — не меньше n (r_alias.c, R_AliasPreparePoints: у id это массив на стеке). Сторона 1
+ * память не берёт (куча — у игры): BZ_EntBegin запасает место на самую большую модель кадра. NULL — места нет. */
+void *BZ_EntVerts (int n)
+{
+	if (n + 4 > ent_fv_cap)
+	{
+		finalvert_t *p;
+
+		if (bz_ectx ())
+			return NULL;
+		p = malloc ((size_t)(n + 4) * sizeof(finalvert_t) + CACHE_SIZE);
+		if (!p)
+			return NULL;
+		free (ent_fv_raw);
+		ent_fv_raw = p;
+		ent_fv = (finalvert_t *)(((uintptr_t)p + CACHE_SIZE - 1) & ~(uintptr_t)(CACHE_SIZE - 1));
+		ent_fv_cap = n + 4;
+	}
+	return ent_fv;
+}
+
+/* Con_Printf у моделей (e_ri): у игры — сразу, у стороны 1 — запомнить первое, напечатает игра (BZ_EntJoin). */
+void BZ_EntPrintf (int print_level, char *fmt, ...)
+{
+	va_list ap;
+	char    buf[256];
+
+	va_start (ap, fmt);
+	vsnprintf (buf, sizeof(buf), fmt, ap);
+	va_end (ap);
+	if (!bz_ectx ())
+	{
+		ri.Con_Printf (print_level, "%s", buf);
+		return;
+	}
+	if (!ent_nmsg++)
+		memcpy (ent_msg, buf, sizeof(ent_msg));
+}
+
+#if defined BZ_ONLY && !defined BZ_ESP
+/* ПК, bz_ent 2: модели своим потоком (функции Windows — без windows.h: он не уживается с заголовками id) */
+__declspec(dllimport) void *__stdcall CreateThread (void *sa, size_t stack, unsigned long (__stdcall *fn) (void *),
+                                                     void *arg, unsigned long flags, unsigned long *id);
+__declspec(dllimport) unsigned long __stdcall WaitForSingleObject (void *h, unsigned long ms);
+__declspec(dllimport) int __stdcall CloseHandle (void *h);
+static void    *ent_thread;
+static unsigned ent_fpcw;         /* слово управления FPU игры: точность x87 у потока — та же (иначе float другие) */
+unsigned int __cdecl _control87 (unsigned int value, unsigned int mask);
+
+static unsigned long __stdcall ent_thread_fn (void *arg)
+{
+	(void)arg;
+	_control87 (ent_fpcw, 0xFFFFFFFFu);
+	bz_ectx_pc = 1;
+	E_DrawEntities (0);
+	return 0;
+}
+#endif
+
+#ifdef BZ_ESP
+/* Задача LINK (ядро 0, bz_link.c): непрозрачные модели кадра, отданного BZ_EntBegin. */
+void BZ_EntRun (void)
+{
+	cb_ent.w = bz_link_ent_chunk (NULL, 0);
+	cb_ent.n = 0;
+	cb_ent.cap = ENT_WORDS;
+	cb_forget (&cb_ent);
+	E_DrawEntities (0);
+	bz_link_ent_end (cb_ent.w, cb_ent.n);
+	cb_ent.w = NULL;
+	cb_ent.n = cb_ent.cap = 0;
+}
+#endif
+
+/* Игра, перед миром (R_RenderFrame1, p06): копии вида для моделей; можно — отдать их стороне 1. */
+void BZ_EntBegin (void)
+{
+	int i, need = 0;
+
+#ifdef BZ_ONLY
+	VectorCopy (vpn, e_vpn);
+	VectorCopy (vright, e_vright);
+	VectorCopy (vup, e_vup);
+	memcpy (e_view_clipplanes, view_clipplanes, sizeof(e_view_clipplanes));
+	if (!e_ri.Con_Printf)
+	{
+		e_ri = ri;
+		e_ri.Con_Printf = BZ_EntPrintf;
+	}
+#endif
+	ent_posted = 0;
+	ent_ntex = 0;
+	if (!bz_ent_cv)
+		bz_ent_cv = ri.Cvar_Get ("bz_ent", "1", 0);
+#ifndef BZ_ONLY
+	return;                         /* ref_bz: моделей на другой стороне нет */
+#endif
+	if (!bz_ent_cv->value || !r_drawentities->value || !r_newrefdef.num_entities || !BZ_Enabled ())
+	{
+		bz_ent_skip[0]++;
+		return;
+	}
+#ifdef BZ_ESP
+	if (need_setup || !ent_pool || !bz_link_ent_ok ())
+	{
+		bz_ent_skip[1]++;
+		return;
+	}
+#endif
+	/* шкурки непрозрачных моделей и картинки спрайтов — в таблицу кадра (как их возьмут R_AliasSetupSkin и
+	 * R_DrawSprite id); вершин — на самую большую модель */
+	for (i = 0; i < r_newrefdef.num_entities; i++)
+	{
+		entity_t *e = &r_newrefdef.entities[i];
+		model_t  *m = e->model;
+
+		if ((e->flags & (RF_TRANSLUCENT | RF_BEAM)) || !m)
+			continue;
+		if (m->type == mod_alias)
+		{
+			dmdl_t  *pmdl = (dmdl_t *)m->extradata;
+			image_t *skin = e->skin;
+
+			if (!skin)
+			{
+				int s = e->skinnum;
+				if (s >= pmdl->num_skins || s < 0)
+					s = 0;
+				skin = m->skins[s];
+			}
+			if (skin)
+				ent_tex_add (skin, skin->width, skin->height);
+			if (pmdl->num_xyz > need)
+				need = pmdl->num_xyz;
+		}
+		else if (m->type == mod_sprite)
+		{
+			dsprite_t *ps = (dsprite_t *)m->extradata;
+			int        f = ps->numframes > 0 ? e->frame % ps->numframes : -1;
+
+			if (f >= 0 && m->skins[f])
+				ent_tex_add (m->skins[f], ps->frames[f].width, ps->frames[f].height);
+		}
+	}
+	if (!BZ_EntVerts (need))
+	{
+		bz_ent_skip[2]++;
+		return;
+	}
+#ifdef BZ_ESP
+	/* кадры md2 модели прочтут сами: ядро должно было пройти MARK после их записи (одно чтение регистра; не прошло —
+	 * модели этого кадра рисует игра, её store_read подождёт) */
+	if (!store_md2_seen)
+	{
+		if (!bz_link_mark_reached (store_md2_mark))
+		{
+			bz_ent_skip[3]++;
+			return;
+		}
+		store_md2_seen = 1;
+	}
+	if (!md2_ring && BZ_StoreAvailable () && (md2_ring = malloc (MD2_RING)) == NULL)
+	{
+		bz_ent_skip[3]++;
+		return;
+	}
+	ent_posted = 1;
+	bz_link_ent_post ();
+#elif defined BZ_ONLY
+	ent_posted = 1;
+	if (bz_ent_cv->value >= 2)
+	{
+		ent_fpcw = _control87 (0, 0);
+		ent_thread = CreateThread (NULL, 1u << 20, ent_thread_fn, NULL, 0, NULL);
+		if (!ent_thread)
+			ent_posted = 0;
+	}
+	else
+	{
+		bz_ectx_pc = 1;
+		E_DrawEntities (0);
+		bz_ectx_pc = 0;
+	}
+#endif
+}
+
+/* Игра, на месте моделей (R_DrawEntitiesOnList, p06): 1 — непрозрачные модели посчитала сторона 1, их куски встают
+ * в поток здесь; 0 — не отдавались (рисует игра сама, как раньше). */
+int BZ_EntJoin (void)
+{
+	uint32_t words;
+
+	if (!ent_posted)
+		return 0;
+#ifdef BZ_ESP
+	cb_main_ship ();                /* мир и небо — в очередь раньше моделей */
+	bz_link_ent_join ();            /* метка «здесь — модели»; ждать, пока задача LINK их досчитает */
+	words = 0;
+#else
+#ifdef BZ_ONLY
+	if (ent_thread)
+	{
+		WaitForSingleObject (ent_thread, 0xFFFFFFFFu);
+		CloseHandle (ent_thread);
+		ent_thread = NULL;
+	}
+#endif
+	/* ПК: слова моделей — в буфер кадра на их месте (как небо в BZ_EndWorld) */
+	words = cb_ent.n;
+	{
+		uint32_t i;
+		for (i = 0; i < cb_ent.n; i++)
+			put (cb_ent.w[i]);
+	}
+	cb_ent.n = 0;
+	cb_forget (&cb_ent);
+#endif
+	cb_forget (&cb_main);           /* ядро помнит TEX моделей — наше «последнее» уже не то */
+	ent_posted = 0;
+	ent_frame_words = words;
+	if (words > ent_words_max)
+		ent_words_max = words;
+	ent_words_sum += words;
+	ent_frames++;
+	if (ent_nmsg)
+	{
+		ri.Con_Printf (PRINT_ALL, "%s", ent_msg);
+		ent_nmsg = 0;
+	}
+	return 1;
+}
+
+/* Счётчики стороны 1 — к счётчикам кадра (BZ_EndFrame). */
+static void fs_merge (void)
+{
+	uint64_t *a = (uint64_t *)&fs_ctx[0], *b = (uint64_t *)&fs_ctx[1];
+	size_t    i;
+
+	for (i = 0; i < sizeof(bz_fstat_t) / sizeof(uint64_t); i++)
+	{
+		a[i] += b[i];
+		b[i] = 0;
+	}
+}
+
 /* ---------------------------------------------------------------- 2D */
 
 static void put_pic (int x, int y, int w, int h, uint32_t addr, int stride, uint32_t ss, uint32_t ts, int key)
@@ -1637,6 +2319,13 @@ void BZ_Init (void)
 	bz_trace_cv = ri.Cvar_Get ("bz_trace", "0", 0);
 	q2m_out_cv = ri.Cvar_Get ("q2m_out", "", 0);
 	q2m_frame_cv = ri.Cvar_Get ("q2m_frame", "0", 0);
+	/* 28.11.2026: модели на стороне 1 («МОДЕЛИ НА ЯДРЕ 0»): 0 — их рисует игра на своём месте, как раньше; 1 — ESP:
+	 * задача LINK на ядре 0, ПК: заранее, до мира; 2 — ПК: своим потоком параллельно с миром */
+	bz_ent_cv = ri.Cvar_Get ("bz_ent", "1", 0);
+#ifdef BZ_ONLY
+	e_ri = ri;                       /* консоль моделей (bz_ent.h): со стороны 1 — через BZ_EntPrintf */
+	e_ri.Con_Printf = BZ_EntPrintf;
+#endif
 #if defined BZ_ONLY && !defined BZ_ESP
 	/* q2esp.exe с Q2M_HOT=1 (26.11.2026): горячие функции — через таблицы, как у модуля Q2HOT.ELF на ESP
 	 * (esp/hot/q2hot.c собран сюда же с переназначением имён) — кадры должны совпасть с обычной сборкой */
@@ -1704,6 +2393,26 @@ void BZ_Shutdown (void)
 	soft_copy = NULL;
 #ifdef BZ_ESP
 	bz_link_wait_idle ();             /* буферы могла ещё отправлять задача LINK */
+	if (ent_pool)
+	{
+		bz_link_ent_pool (NULL, 0, 0);   /* хвост cb_blk — уйдёт вместе с ним */
+		ent_pool = NULL;
+	}
+	cb_lend_ent = 0;
+	if (cb_blk)
+	{
+		/* одним куском: одолженное ещё держат (выгрузка модуля освободит всё сама) — тогда кусок не трогать */
+		if (!cb_lent)
+			free (cb_blk);
+		cb_blk = NULL;
+		cb_main.w = NULL;
+		cb_spare[0] = cb_spare[1] = NULL;
+		cb_lent = 0;
+		cb_lend_off = 0;
+		cb_nspare = cb_spare_failed = 0;
+		bz_link_set_depth (1);
+	}
+	else
 	{
 		int i;
 		for (i = 0; i < cb_nspare; i++)
@@ -1719,6 +2428,23 @@ void BZ_Shutdown (void)
 	free (cb_sky.w);
 	memset (&cb_main, 0, sizeof(cb_main));
 	memset (&cb_sky, 0, sizeof(cb_sky));
+#ifndef BZ_ESP
+	free (cb_ent.w);
+#endif
+	memset (&cb_ent, 0, sizeof(cb_ent));
+	free (ent_fv_raw);
+	ent_fv_raw = ent_fv = NULL;
+	ent_fv_cap = 0;
+	if (ent_frames)
+		ri.Con_Printf (PRINT_DEVELOPER, "bz: models on side 1: %u frames, words per frame max %u, mean %u; "
+		              "textures not in the frame table %u\n", (unsigned)ent_frames, (unsigned)ent_words_max,
+		              (unsigned)(ent_words_sum / ent_frames), ent_tex_miss);
+#ifndef BZ_ESP
+	if (ent_frames)
+		fprintf (stderr, "bz: models on side 1: %u frames, words per frame max %u, mean %u; "
+		         "textures not in the frame table %u\n", (unsigned)ent_frames, (unsigned)ent_words_max,
+		         (unsigned)(ent_words_sum / ent_frames), ent_tex_miss);
+#endif
 }
 
 void BZ_SaveSoft (void)
@@ -1880,9 +2606,10 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 	cb_main_ship ();                /* кадр уходит задачей LINK — следующий готовится параллельно */
 	cb_forget (&cb_main);
 	cb_forget (&cb_sky);
-	memset (&fs, 0, sizeof(fs));
+	memset (fs_ctx, 0, sizeof(fs_ctx));
 	return;
 #else
+	fs_merge ();                    /* счётчики моделей (сторона 1) — к счётчикам кадра */
 	/* Трасса для стенда RTL: на кадр — слово «сколько слов», цвет отладочной заливки (−1 — нет) и
 	 * сами слова команд. Стенд выполняет их и в RTL, и в этой же C-модели и сравнивает кадры. */
 	if (bz_trace_cv->value && q2m_out_cv->string[0])
@@ -1940,11 +2667,11 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 			fprintf (csv, "frame,underwater,diff,diff_vis,cmd_bytes,tex_bytes,lm_bytes,other_bytes,lm_builds,"
 			              "tex_uploads,faces,tris,parts,polys,px_raster,px_zfail,px_key,px_written,px_fill,"
 			              "tex_reads,tex_miss,lm_fetch,divides,seg,seg_zread,seg_zwrite,seg_cread,seg_cwrite,mcrc,"
-			              "tex_used,sky_bytes\n");
+			              "tex_used,sky_bytes,ent_bytes\n");
 	}
 	if (csv)
 		fprintf (csv, "%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
-		              "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%08x,%u,%u\n",
+		              "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%08x,%u,%u,%u\n",
 		         frame, (r_newrefdef.rdflags & RDF_UNDERWATER) ? 1 : 0, diff, vis,
 		         (unsigned long long)st->cmd_words * 4, (unsigned long long)fs.tex_bytes,
 		         (unsigned long long)fs.lm_bytes, (unsigned long long)fs.other_bytes,
@@ -1960,7 +2687,9 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 		         (unsigned long long)st->seg_cwrite,
 		         (unsigned)model_frame_crc (mf, soft_w, soft_h, bz_stride (model), palette_rgba),
 		         (unsigned)(tex_next - mapa.tex),      /* SDRAM под текстурами сейчас (замер 24.11) */
-		         (unsigned)sky_frame_words * 4);       /* слов неба в кадре × 4 — буфер cb_sky (замер 24.11) */
+		         (unsigned)sky_frame_words * 4,        /* слов неба в кадре × 4 — буфер cb_sky (замер 24.11) */
+		         (unsigned)ent_frame_words * 4);       /* слов моделей стороны 1 × 4 — куски cb_ent (28.11.2026) */
+	ent_frame_words = 0;
 	sky_frame_words = 0;
 
 	if (bz_dump_cv->value > 0 && q2m_out_cv->string[0] && frame % (int)bz_dump_cv->value == 0)
@@ -2006,7 +2735,7 @@ void BZ_EndFrame (const unsigned char *palette_rgba)
 	cb_forget (&cb_main);
 	cb_forget (&cb_sky);
 	bz_stats_reset (model);
-	memset (&fs, 0, sizeof(fs));
+	memset (fs_ctx, 0, sizeof(fs_ctx));
 #endif
 }
 
